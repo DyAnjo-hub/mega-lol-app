@@ -1,219 +1,238 @@
-import math
-from typing import List
+from typing import List, Tuple
 
 import streamlit as st
+
 from modelo_winrate_mega import calcular_chance_vitoria
-
-# ==========================
-# CONFIG
-# ==========================
-
-EDGE_MIN = 8.0      # edge mínimo p.p. para entrar
-KELLY_CAP = 0.05    # teto de Kelly (5% da banca)
-
-
-# ==========================
-# FUNÇÕES AUX
-# ==========================
-
-def parse_float(s: str):
-    """Converte string com vírgula/ponto para float. Retorna None se der erro."""
-    if s is None:
-        return None
-    s = str(s).strip().replace(",", ".")
-    if not s:
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
 
 
 def parse_champs(raw: str) -> List[str]:
     """Transforma 'Aatrox, Ahri, Jinx, ...' em lista limpa."""
-    return [c.strip() for c in raw.split(",") if c.strip()]
+    return [champ.strip() for champ in raw.split(",") if champ.strip()]
 
 
-def implied_prob(odd: float):
-    """Prob implícita em %."""
-    if odd is None or odd <= 1.0:
-        return None
-    return 100.0 / odd
+def classificar_vantagem(delta: float) -> Tuple[str, str]:
+    """Classifica a diferenca entre os times em uma leitura simples."""
+    if delta < 2.0:
+        return "Equilibrado", "Draft muito proximo. A leitura pede cautela."
+    if delta < 5.0:
+        return "Leve vantagem", "Existe inclinacao, mas ainda sem dominio claro."
+    if delta < 8.0:
+        return "Vantagem relevante", "O modelo enxerga um lado mais confortavel."
+    return "Forte vantagem", "A diferenca de poder esta bem marcada pelo modelo."
 
 
-def kelly_fraction(odd: float, p_model_pct: float):
-    """Kelly cheio (fração da banca)."""
-    if odd is None or odd <= 1.0:
-        return 0.0
-    p = p_model_pct / 100.0
-    if p <= 0.0 or p >= 1.0:
-        return 0.0
-    b = odd - 1.0
-    return (odd * p - 1.0) / b
+def formatar_lista(champs: List[str]) -> str:
+    return " / ".join(champs)
 
 
-def odd_minima_para_entrar(p_model_pct: float, edge_min: float):
+st.set_page_config(page_title="MEGA LoL - Radar de Draft", layout="wide")
+
+st.markdown(
     """
-    Calcula a odd mínima para essa probabilidade do modelo
-    atender a regra: edge > edge_min e Kelly > 0.
+    <style>
+        .block-container {
+            max-width: 1120px;
+            padding-top: 2rem;
+            padding-bottom: 2.5rem;
+        }
 
-    Se p_model <= edge_min, não existe odd que faça edge > edge_min (retorna None).
-    """
-    if p_model_pct <= 0:
-        return None
+        .mega-title {
+            font-size: 2.35rem;
+            font-weight: 800;
+            letter-spacing: 0;
+            margin-bottom: 0.25rem;
+        }
 
-    # Kelly > 0  -> aposta +EV  -> odd > 100 / p_model
-    odd_kelly_min = 100.0 / p_model_pct
+        .mega-subtitle {
+            color: #9ca3af;
+            font-size: 1rem;
+            margin-bottom: 1.4rem;
+        }
 
-    # Edge > edge_min:
-    # p_model - 100/odd > edge_min  ->  odd > 100 / (p_model - edge_min)
-    if p_model_pct <= edge_min:
-        return None  # nunca bate edge_min
-    odd_edge_min = 100.0 / (p_model_pct - edge_min)
+        .panel {
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            border-radius: 8px;
+            padding: 1.05rem 1.15rem;
+            background: rgba(17, 24, 39, 0.58);
+        }
 
-    # precisa satisfazer as duas coisas ao mesmo tempo
-    return max(odd_kelly_min, odd_edge_min)
+        .side-label {
+            color: #cbd5e1;
+            font-size: 0.84rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 0.35rem;
+        }
 
+        .winner-card {
+            border: 1px solid rgba(34, 197, 94, 0.34);
+            border-radius: 8px;
+            padding: 1rem 1.1rem;
+            background: rgba(20, 83, 45, 0.23);
+        }
 
-# ==========================
-# UI STREAMLIT
-# ==========================
+        .winner-kicker {
+            color: #86efac;
+            font-size: 0.78rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
 
-st.set_page_config(page_title="MEGA LoL EV", layout="centered")
+        .winner-name {
+            font-size: 2rem;
+            font-weight: 850;
+            line-height: 1.15;
+            margin-top: 0.2rem;
+        }
 
-st.title("MEGA LoL – Decisor de aposta (draft + odds)")
+        .winner-note {
+            color: #d1fae5;
+            font-size: 0.95rem;
+            margin-top: 0.4rem;
+        }
 
-st.caption(
-    f"Regra: edge > {EDGE_MIN} p.p. e Kelly > 0, com teto de {KELLY_CAP*100:.1f}% da banca."
+        .draft-list {
+            color: #d1d5db;
+            font-size: 0.95rem;
+            line-height: 1.45;
+            margin-top: 0.4rem;
+        }
+
+        div[data-testid="stMetric"] {
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 8px;
+            padding: 0.85rem 0.95rem;
+            background: rgba(15, 23, 42, 0.5);
+        }
+
+        div[data-testid="stMetricLabel"] {
+            color: #cbd5e1;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-size: 1.75rem;
+        }
+
+        .stButton > button {
+            width: 100%;
+            border-radius: 8px;
+            min-height: 2.8rem;
+            font-weight: 800;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# Inputs principais
-banca_str = st.text_input("Banca atual (R$)", value="2000")
+st.markdown('<div class="mega-title">MEGA LoL - Radar de forca do draft</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="mega-subtitle">Indicador comparativo entre composicoes. Sem odds, sem Kelly, sem edge: apenas leitura de poder entre os campeoes.</div>',
+    unsafe_allow_html=True,
+)
 
-col1, col2 = st.columns(2)
-with col1:
-    champs_azul_raw = st.text_input(
-        "Time AZUL (5 champs, separados por vírgula)",
-        value="Shen, Vi, Syndra, Smolder, Nautilus",
-    )
-    odd_azul_str = st.text_input("Odd time AZUL", value="2,30")
+with st.container():
+    col_azul, col_vermelho = st.columns(2, gap="large")
 
-with col2:
-    champs_vermelho_raw = st.text_input(
-        "Time VERMELHO (5 champs, separados por vírgula)",
-        value="Vayne, Aatrox, Ahri, Sivir, Lulu",
-    )
-    odd_vermelho_str = st.text_input("Odd time VERMELHO", value="1,55")
+    with col_azul:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="side-label">Time azul</div>', unsafe_allow_html=True)
+        champs_azul_raw = st.text_input(
+            "Campeoes do time azul",
+            value="Shen, Vi, Syndra, Smolder, Nautilus",
+            label_visibility="collapsed",
+            placeholder="Ex: Aurora, Pantheon, Sylas, Miss Fortune, Gragas",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-botao = st.button("Calcular aposta")
+    with col_vermelho:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="side-label">Time vermelho</div>', unsafe_allow_html=True)
+        champs_vermelho_raw = st.text_input(
+            "Campeoes do time vermelho",
+            value="Vayne, Aatrox, Ahri, Sivir, Lulu",
+            label_visibility="collapsed",
+            placeholder="Ex: Sion, Xin Zhao, LeBlanc, Varus, Alistar",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-if botao:
-    # Parse básico
-    banca = parse_float(banca_str)
-    odd_azul = parse_float(odd_azul_str)
-    odd_vermelho = parse_float(odd_vermelho_str)
+calcular = st.button("Analisar poder do draft", type="primary")
 
+if calcular:
     champs_azul = parse_champs(champs_azul_raw)
     champs_vermelho = parse_champs(champs_vermelho_raw)
 
-    # Validações
-    if banca is None or banca <= 0:
-        st.error("Banca inválida.")
-    elif odd_azul is None or odd_vermelho is None:
-        st.error("Odd inválida. Use algo como 2,30 ou 1.8.")
-    elif len(champs_azul) != 5 or len(champs_vermelho) != 5:
-        st.error("Cada time precisa ter exatamente 5 campeões.")
-    else:
-        # Calcula p_model com o MEGA
-        try:
-            p_azul, p_vermelho = calcular_chance_vitoria(
-                champs_azul, champs_vermelho, verbose=False
-            )
-        except Exception as e:
-            st.error(f"Erro no modelo: {e}")
-            st.stop()
+    if len(champs_azul) != 5 or len(champs_vermelho) != 5:
+        st.error("Cada time precisa ter exatamente 5 campeoes separados por virgula.")
+        st.stop()
 
-        st.subheader("Probabilidades do modelo")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("p_model AZUL", f"{p_azul:.2f}%")
-        with c2:
-            st.metric("p_model VERMELHO", f"{p_vermelho:.2f}%")
+    try:
+        p_azul, p_vermelho = calcular_chance_vitoria(
+            champs_azul, champs_vermelho, verbose=False
+        )
+    except Exception as exc:
+        st.error(f"Erro no modelo: {exc}")
+        st.stop()
 
-        # Odd mínima pra cada lado pela sua regra
-        odd_min_azul = odd_minima_para_entrar(p_azul, EDGE_MIN)
-        odd_min_vermelho = odd_minima_para_entrar(p_vermelho, EDGE_MIN)
+    lado_forte = "AZUL" if p_azul >= p_vermelho else "VERMELHO"
+    prob_forte = max(p_azul, p_vermelho)
+    prob_fraco = min(p_azul, p_vermelho)
+    delta = prob_forte - prob_fraco
+    leitura, descricao = classificar_vantagem(delta)
 
-        st.subheader("Odd mínima para valer a pena (pela regra)")
+    st.divider()
 
-        c3, c4 = st.columns(2)
-        with c3:
-            if odd_min_azul is None:
-                st.metric("Odd mínima AZUL", "—")
-            else:
-                st.metric("Odd mínima AZUL", f"{odd_min_azul:.2f}")
-        with c4:
-            if odd_min_vermelho is None:
-                st.metric("Odd mínima VERMELHO", "—")
-            else:
-                st.metric("Odd mínima VERMELHO", f"{odd_min_vermelho:.2f}")
+    top_left, top_right = st.columns([1.1, 1], gap="large")
+    with top_left:
+        st.markdown(
+            f"""
+            <div class="winner-card">
+                <div class="winner-kicker">lado mais forte no indicador</div>
+                <div class="winner-name">{lado_forte}</div>
+                <div class="winner-note">{leitura}. {descricao}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # Decide lado pelo p_model
-        if p_azul >= p_vermelho:
-            lado = "AZUL"
-            p_model = p_azul
-            odd_escolhida = odd_azul
-        else:
-            lado = "VERMELHO"
-            p_model = p_vermelho
-            odd_escolhida = odd_vermelho
+    with top_right:
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Diferenca", f"{delta:.2f} p.p.")
+        with m2:
+            st.metric("Forca do lado lider", f"{prob_forte:.2f}%")
 
-        p_house = implied_prob(odd_escolhida)
-        edge = None if p_house is None else (p_model - p_house)
-        kelly_full = kelly_fraction(odd_escolhida, p_model)
-        kelly_cap = min(kelly_full, KELLY_CAP)
-        if kelly_cap < 0:
-            kelly_cap = 0.0
+    st.subheader("Placar do modelo")
+    score_azul, score_vermelho = st.columns(2, gap="large")
+    with score_azul:
+        st.metric("AZUL", f"{p_azul:.2f}%")
+        st.progress(int(round(p_azul)))
+        st.markdown(
+            f'<div class="draft-list">{formatar_lista(champs_azul)}</div>',
+            unsafe_allow_html=True,
+        )
 
-        st.subheader("Resumo da aposta sugerida")
-        c5, c6, c7 = st.columns(3)
-        with c5:
-            st.metric("Lado recomendado", lado)
-        with c6:
-            st.metric("Odd usada", f"{odd_escolhida:.2f}")
-        with c7:
-            st.metric(
-                "p_house (impl.)",
-                f"{p_house:.2f}%" if p_house is not None else "-",
-            )
+    with score_vermelho:
+        st.metric("VERMELHO", f"{p_vermelho:.2f}%")
+        st.progress(int(round(p_vermelho)))
+        st.markdown(
+            f'<div class="draft-list">{formatar_lista(champs_vermelho)}</div>',
+            unsafe_allow_html=True,
+        )
 
-        c8, c9, c10 = st.columns(3)
-        with c8:
-            st.metric("Edge (p.p.)", f"{edge:.2f}" if edge is not None else "-")
-        with c9:
-            st.metric("Kelly cheio", f"{kelly_full*100:.2f}%")
-        with c10:
-            st.metric("Kelly capado", f"{kelly_cap*100:.2f}%")
+    st.subheader("Leitura operacional")
+    l1, l2, l3 = st.columns(3)
+    with l1:
+        st.metric("Estado do confronto", leitura)
+    with l2:
+        st.metric("Time pressionado", "VERMELHO" if lado_forte == "AZUL" else "AZUL")
+    with l3:
+        st.metric("Perfil de uso", "Stake fixa")
 
-        # Regra de entrada
-        entra = edge is not None and edge > EDGE_MIN and kelly_full > 0
-
-        # Mensagem final
-        if entra and kelly_cap > 0:
-            stake = banca * kelly_cap
-            st.success(
-                f"✅ ENTRA\n\n"
-                f"Lado: **{lado}** @ **{odd_escolhida:.2f}**\n\n"
-                f"Stake sugerida: **R$ {stake:.2f}** "
-                f"({kelly_cap*100:.2f}% da banca)."
-            )
-        else:
-            msg = "❌ Sem entrada pela regra (edge ou Kelly não batem).\n\n"
-            if odd_min_azul is not None or odd_min_vermelho is not None:
-                msg += "Para valer a pena, pelas probabilidades atuais:\n"
-                if odd_min_azul is not None:
-                    msg += f"- AZUL começaria a valer a partir de ~**{odd_min_azul:.2f}**\n"
-                if odd_min_vermelho is not None:
-                    msg += f"- VERMELHO começaria a valer a partir de ~**{odd_min_vermelho:.2f}**\n"
-            st.warning(msg)
-            st.write("Stake sugerida: **R$ 0,00**.")
+    st.info(
+        "Use o painel como indicador de poder do draft. A decisao final pode considerar contexto externo, "
+        "patch, lado do mapa, prioridade de lanes, substituicoes e qualidade recente dos times."
+    )
+else:
+    st.info("Preencha os dois drafts e clique em analisar para gerar o placar de poder.")
