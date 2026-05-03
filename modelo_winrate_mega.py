@@ -19,23 +19,31 @@ winrate_with = pd.read_excel(ARQ_DADOS, sheet_name="Winrate_with")
 def limpar_numero(x):
     """
     Converte números da planilha para float.
-    Aceita:
-    - 0.44
-    - '0.44'
-    - '8,886.00'
-    - '55%'
+    Aceita formatos com vírgula de milhar e porcentagem.
+    Ex: 0.44, '0.44', '8,886.00', '55%', 55
     """
     if pd.isna(x):
         return 0.0
     if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x)
-    s = s.replace(",", "")  # tira vírgula de milhar
-    s = s.replace("%", "")
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
+        value = float(x)
+    else:
+        s = str(x).strip()
+        if not s:
+            return 0.0
+        s = s.replace(",", "")
+        percent = "%" in s
+        s = s.replace("%", "")
+        try:
+            value = float(s)
+        except ValueError:
+            return 0.0
+        if percent:
+            value /= 100.0
+    # Se é um número maior que 1 e não é uma porcentagem explícita,
+    # assumir que é uma taxa em base 100 (por exemplo 50 -> 0.50).
+    if value > 1.0:
+        value /= 100.0
+    return value
 
 
 def normalizar_nome(nome):
@@ -47,6 +55,7 @@ def normalizar_nome(nome):
         .lower()
         .replace(" ", "")
         .replace("'", "")
+        .replace(".", "")
     )
 
 
@@ -76,27 +85,23 @@ def preparar_tabela(df):
 
     df["campeao"] = df["campeao"].apply(normalizar_nome)
     df["champion"] = df["champion"].apply(normalizar_nome)
-    df["games"] = df["games"].apply(limpar_numero)
+    df["games"] = pd.to_numeric(df["games"].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
     df["winrate"] = df["winrate"].apply(limpar_numero)
 
-    # limpa linhas zoada
+    # limpa linhas inválidas
     df = df[
         (df["games"] > 0)
         & df["campeao"].notna()
         & df["champion"].notna()
     ]
 
-    registros = {}
-    for _, row in df.iterrows():
-        chave = (row["campeao"], row["champion"])
-        jogos = float(row["games"])
-        # winrate vem em fração (0.x). Se estiver em %, ajuste sua planilha.
-        wins = float(row["winrate"]) * jogos
+    df["wins"] = df["games"] * df["winrate"]
+    grouped = df.groupby(["campeao", "champion"], sort=False, as_index=False)[["games", "wins"]].sum()
 
-        j_ant, w_ant = registros.get(chave, (0.0, 0.0))
-        registros[chave] = (j_ant + jogos, w_ant + wins)
-
-    return registros
+    return {
+        (row["campeao"], row["champion"]): (row["games"], row["wins"])
+        for _, row in grouped.iterrows()
+    }
 
 
 # monta os dicionários uma vez só
