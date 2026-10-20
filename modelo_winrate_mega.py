@@ -147,21 +147,21 @@ def calcular_winrate_with(time):
     total_p = 0.0
     total_w = 0.0
 
+    # Ordem fixa tambem evita diferencas de arredondamento na soma.
+    time = sorted(time, key=normalizar_nome)
     n = len(time)
     for i in range(n):
         for j in range(i + 1, n):
             a = normalizar_nome(time[i])
             b = normalizar_nome(time[j])
 
-            chave1 = (a, b)
-            chave2 = (b, a)
-
-            if chave1 in dict_with:
-                jogos, wins = dict_with[chave1]
-            elif chave2 in dict_with:
-                jogos, wins = dict_with[chave2]
-            else:
+            # Escolhe a direcao com mais jogos, sem somar amostras
+            # que podem se sobrepor. Empates usam a chave alfabetica.
+            chaves = {chave for chave in ((a, b), (b, a)) if chave in dict_with}
+            if not chaves:
                 continue
+            chave = min(chaves, key=lambda item: (-dict_with[item][0], item))
+            jogos, wins = dict_with[chave]
 
             total_p += jogos
             total_w += wins
