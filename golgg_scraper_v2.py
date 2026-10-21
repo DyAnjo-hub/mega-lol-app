@@ -1,8 +1,11 @@
 import argparse
 import io
+import csv
+import hashlib
+import os
+from urllib.parse import urlsplit, unquote
 import time
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
 
 import pandas as pd
 import json
@@ -11,65 +14,38 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import field
 
 
 def load_browser_dependencies():
     # Browser/clipboard packages are only required for interactive collection.
-    global pyperclip, webdriver, Service, By, EC, Select, WebDriverWait, ChromeDriverManager
+    global pyperclip, webdriver, Service, By, Select, ChromeDriverManager
     import pyperclip
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import Select, WebDriverWait
+    from selenium.webdriver.support.ui import Select
     from webdriver_manager.chrome import ChromeDriverManager
-
-
-SEASON = 'S16'
-SPLIT = 'ALL'
-TOURNAMENT = 'ALL'
-BASE_URL = 'https://gol.gg/premium/champion-synergy/1/season-{season}/split-{split}/tournament-{tournament}/'
-
-CHAMPION_NAMES = {
-    'Aatrox','Ahri','Akali','Akshan','Alistar','Amumu','Anivia','Annie','Aphelios','Ashe','Aurelion Sol',
-    'Azir','Bard','Belveth','Blitzcrank','Brand','Braum','Caitlyn','Camille','Cassiopeia','Cho Gath','Corki',
-    'Darius','Diana','Dr Mundo','Draven','Ekko','Elise','Evelynn','Ezreal','Fiddlesticks','Fiora','Fizz',
-    'Galio','Gangplank','Garen','Gnar','Gragas','Graves','Gwen','Hecarim','Heimerdinger','Illaoi','Irelia','Ivern',
-    'Janna','Jarvan IV','Jax','Jayce','Jhin','Jinx','Kai Sa','Kalista','Karma','Karthus','Kassadin','Katarina','Kayle',
-    'Kayn','Kennen','Kha Zix','Kindred','Kled','Kog Maw','Leblanc','Lee Sin','Leona','Lillia','Lissandra','Lucian',
-    'Lulu','Lux','Malphite','Malzahar','Maokai','Master Yi','Miss Fortune','Mordekaiser','Morgana','Nami','Nasus',
-    'Nautilus','Neeko','Nidalee','Nilah','Nocturne','Nunu & Willump','Olaf','Orianna','Ornn','Pantheon','Poppy',
-    'Pyke','Qiyana','Quinn','Rakan','Rammus','Rek Sai','Renata Glasc','Renekton','Rengar','Riven','Rumble','Ryze',
-    'Samira','Sejuani','Senna','Seraphine','Sett','Shaco','Shen','Shyvana','Singed','Sion','Sivir','Skarner','Sona',
-    'Soraka','Swain','Sylas','Syndra','Tahm Kench','Taliyah','Talon','Taric','Teemo','Thresh','Tristana','Trundle',
-    'Tryndamere','Twisted Fate','Twitch','Udyr','Urgot','Varus','Vayne','Veigar','Vel Koz','Vi','Viego',
-    'Viktor','Vladimir','Volibear','Warwick','Wukong','Xayah','Xerath','Xin Zhao','Yasuo','Yone','Yorick','Yuumi',
-    'Zac','Zed','Ziggs','Zilean','Zoe','Zyra'
-}
 
 
 def normalize_name(text: str) -> str:
     return ' '.join(text.replace('\u00a0', ' ').strip().replace("'", '').split()).title()
 
 
-def is_champion_name(text: str) -> bool:
-    if not text:
-        return False
-    return normalize_name(text) in CHAMPION_NAMES or text.strip() in CHAMPION_NAMES
-
-
 UNKNOWN = 'unknown'
-CATEGORIES = ('Direct_Matchup', 'Indirect_Matchup', 'Ally_Synergy')
+CATEGORY_LABELS = {'Direct_Matchup': 'Direct Matchup', 'Indirect_Matchup': 'Indirect Matchup',
+                   'Ally_Synergy': 'Good with'}
+CATEGORIES = tuple(CATEGORY_LABELS)
 HEADERS = ['Campeao', 'Champion', 'Games', 'Winrate', 'Category', 'Source',
            'Source_URL', 'Season', 'Collected_At_UTC', 'Source_Role',
            'Requested_Filters', 'Verified_Active_Filters', 'Source_Fields',
            'CSD@15', 'GD@15', 'XPD@15', 'KDA', 'Capture_ID',
            'Selected_Champion_Normalized', 'Related_Champion_Normalized', 'Source_Context']
-REQUESTED_FILTERS = {'Season': SEASON, 'Split': SPLIT, 'Tournament': TOURNAMENT,
-                     'Game version': 'ALL', 'Role filter': 'ALL', 'Pick Selection': 'ALL',
-                     'Page champion role': UNKNOWN, 'League selections': UNKNOWN,
-                     'Minimum game count': UNKNOWN}
+REQUESTED_FILTERS = dict.fromkeys(
+    ('Season', 'Split', 'Tournament', 'Game version', 'Role filter', 'Pick Selection',
+     'Page champion role', 'League selections', 'Minimum game count'), UNKNOWN)
+CONTROL_FIELDS = {'cbchampselect': 'Selected champion', 'patch': 'Game version',
+                  'cbtournament': 'Tournament', 'rolefilter': 'Role filter',
+                  'pickfilter': 'Pick Selection'}
 
 
 @dataclass
@@ -108,83 +84,13 @@ def init_driver(headless: bool = False):
     return driver
 
 
-def wait_for(driver, locator, timeout=20):
-    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
-
-
-def find_champion_select(driver):
-    selects = driver.find_elements(By.TAG_NAME, 'select')
-    best = None
-    best_champ_count = 0
-    for sel in selects:
-        try:
-            options = Select(sel).options
-        except Exception:
-            continue
-        champ_count = sum(1 for opt in options if is_champion_name(opt.text))
-        if champ_count > best_champ_count:
-            best_champ_count = champ_count
-            best = sel
-    if best is None or best_champ_count == 0:
-        raise RuntimeError('Não encontrei a lista de campeões no site.')
-    return best
-
-
-def get_champion_list(driver) -> List[str]:
-    select = find_champion_select(driver)
-    options = Select(select).options
-    champions = [opt.text.strip() for opt in options if opt.text.strip() and is_champion_name(opt.text)]
-    return sorted(set(champions))
-
-
 def click_tab(driver, label: str):
     possible = driver.find_elements(By.XPATH, "//button|//a|//div[@role='tab']")
     for el in possible:
         text = el.text.strip().lower()
         if el.is_displayed() and label.lower() == text:
             driver.execute_script('arguments[0].click();', el)
-            time.sleep(1.0)
             return True
-    return False
-
-
-def click_element_by_text(driver, text: str, exact: bool = False) -> bool:
-    if exact:
-        xpath = f"//*[normalize-space(text())='{text}']"
-    else:
-        xpath = f"//*[contains(normalize-space(text()), '{text}') ]"
-    candidates = driver.find_elements(By.XPATH, xpath)
-    for el in candidates:
-        if el.is_displayed():
-            try:
-                driver.execute_script('arguments[0].click();', el)
-                time.sleep(0.5)
-                return True
-            except Exception:
-                continue
-    return False
-
-
-def select_champion_custom(driver, champion_name: str) -> bool:
-    current = driver.find_elements(By.XPATH, "//*[contains(text(), 'Aatrox') or contains(text(), 'Champion') or contains(text(), 'Select')]")
-    for el in current:
-        if el.is_displayed():
-            try:
-                driver.execute_script('arguments[0].click();', el)
-                time.sleep(1.0)
-                break
-            except Exception:
-                continue
-
-    for xpath in ["//*[@role='option']", "//li", "//div[contains(@class,'option') or contains(@class,'item') or contains(@class,'dropdown')]"]:
-        for el in driver.find_elements(By.XPATH, xpath):
-            if el.text.strip().lower() == champion_name.lower() and el.is_displayed():
-                try:
-                    driver.execute_script('arguments[0].click();', el)
-                    time.sleep(1.5)
-                    return True
-                except Exception:
-                    continue
     return False
 
 
@@ -211,7 +117,6 @@ def parse_clipboard_table(table_text: str) -> pd.DataFrame:
     """Parse copied TSV without guessing whitespace-separated champion names."""
     if not table_text.strip():
         return pd.DataFrame()
-    import csv
     rows = list(csv.reader(io.StringIO(table_text), delimiter='\t'))
     headers, values = rows[0], rows[1:]
     if len(headers) != len(set(headers)):
@@ -327,16 +232,22 @@ def parse_with_table(champion, df, **metadata):
     return parse_table(champion, df, 'Ally_Synergy', 'Good with', **metadata)
 
 
-def save_results(results, output_path, *, overwrite=False):
+def save_results(results, output_path, *, overwrite=False, source_headers=None):
     """Write one fresh snapshot; never combine, deduplicate or append rows."""
     from openpyxl import Workbook
     output_path = Path(output_path)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f'Refusing to overwrite {output_path}; use --overwrite explicitly.')
-    results = list(results)
-    source_headers = list(dict.fromkeys(key for r in results for key in r.source_fields))
-    workbook = Workbook()
-    workbook.remove(workbook.active)
+    if source_headers is None:
+        results = list(results)
+        source_headers = list(dict.fromkeys(key for r in results for key in r.source_fields))
+    if isinstance(results, list):
+        for record in results:
+            if record.games is not None:
+                parse_games(record.games)
+            if record.winrate is not None:
+                parse_winrate(record.winrate)
+    workbook = Workbook(write_only=True)
     for category in CATEGORIES:
         workbook.create_sheet(category).append(HEADERS + ['Source::' + key for key in source_headers])
     for record in results:
@@ -355,71 +266,130 @@ def save_results(results, output_path, *, overwrite=False):
                   normalize_name(record.champion), normalize_name(record.opponent),
                   json.dumps(record.source_context or UNKNOWN, ensure_ascii=False)]
         sheet = workbook[record.category]
-        sheet.append(values + [record.source_fields.get(key) for key in source_headers])
-        # Keep source strings literal, including strings beginning with '='.
-        for cell in sheet[sheet.max_row]:
+        from openpyxl.cell import WriteOnlyCell
+        cells = [WriteOnlyCell(sheet, value=value) for value in
+                 values + [record.source_fields.get(key) for key in source_headers]]
+        for cell in cells:
             if isinstance(cell.value, str):
                 cell.data_type = 's'
-        sheet.cell(sheet.max_row, 4).number_format = '0.00%'
+        cells[3].number_format = '0.00%'
+        sheet.append(cells)
     # Exclusive creation also prevents a race with another exporter.
     with output_path.open('wb' if overwrite else 'xb') as destination:
         workbook.save(destination)
 
 
-def apply_filters(driver):
-    """Do not change unidentified dropdowns or claim requested values are active.
+def write_json(path, data):
+    temporary = path.with_suffix('.json.tmp')
+    with temporary.open('w', encoding='utf-8') as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2, allow_nan=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
 
-    A label/selector contract has not been verified against live gol.gg markup.
-    Users can set filters interactively; their active state remains unknown here.
-    """
-    return {name: UNKNOWN for name in REQUESTED_FILTERS}
 
-
-def preserve_capture(text, champion, category, directory, *, source_url=UNKNOWN,
-                     verified=None, requested=None, source_context=None, validation_error=None):
-    """Persist untouched clipboard text and context before parsing.
-
-    Failed parses keep both original files. No append/merge/deduplication occurs.
-    """
-    categories = {'Direct_Matchup': 'Direct Matchup',
-                  'Indirect_Matchup': 'Indirect Matchup', 'Ally_Synergy': 'Good with'}
+def begin_capture(text, champion, category, directory, *, source_url=UNKNOWN,
+                  verified=None, requested=None, source_context=None, run_id=UNKNOWN):
+    """Durably save original text before any subsequent browser/parse operation."""
     capture_id = uuid.uuid4().hex
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    collected = datetime.now(timezone.utc).isoformat()
     desired = dict(REQUESTED_FILTERS)
     desired.update({'Selected champion': champion, 'Matchup category': category, 'Source URL': UNKNOWN})
     desired.update(requested or {})
-    observed = {key: UNKNOWN for key in desired}
+    observed = dict.fromkeys(desired, UNKNOWN)
     observed.update(verified or {})
     observed['Source URL'] = source_url
-    metadata = dict(capture_id=capture_id, source_url=source_url,
-                    collected_at_utc=collected, requested=desired, verified=observed,
-                    raw_file=capture_id + '.txt', parse_status='pending',
-                    source_context=source_context or {})
-    raw_path = directory / (capture_id + '.txt')
-    metadata_path = directory / (capture_id + '.json')
-    # Binary UTF-8 avoids newline conversion on Windows; original text is exact.
-    with raw_path.open('xb') as handle:
+    metadata = dict(capture_id=capture_id, run_id=run_id, source_url=source_url,
+                    collected_at_utc=datetime.now(timezone.utc).isoformat(),
+                    requested=desired, verified=observed, raw_file=capture_id + '.txt',
+                    parse_status='pending', source_context=source_context or {},
+                    raw_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest())
+    path = directory / (capture_id + '.json')
+    with path.with_suffix('.txt').open('xb') as handle:
         handle.write(text.encode('utf-8'))
-    with metadata_path.open('x', encoding='utf-8') as handle:
-        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    write_json(path, metadata)
+    return path, metadata
+
+
+def capture_rows(path, metadata):
+    raw = path.with_suffix('.txt').read_bytes()
+    if metadata.get('raw_sha256') and hashlib.sha256(raw).hexdigest() != metadata['raw_sha256']:
+        raise ValueError('Raw capture checksum mismatch: ' + str(path))
+    text = raw.decode('utf-8')
+    category = metadata['requested']['Matchup category']
+    if metadata['source_context'].get('verified_empty_table'):
+        return []
+    return parse_table(metadata['requested']['Selected champion'], parse_clipboard_table(text),
+                       category, CATEGORY_LABELS[category], source_url=metadata['source_url'],
+                       season=metadata['verified'].get('Season', UNKNOWN),
+                       collected_at_utc=metadata['collected_at_utc'],
+                       requested_filters=metadata['requested'], verified_active_filters=metadata['verified'],
+                       capture_id=metadata['capture_id'], source_context=metadata['source_context'])
+
+
+def finish_capture(path, metadata, validation_error=None):
     try:
         if validation_error:
             raise ValueError(validation_error)
-        rows = parse_table(champion, parse_clipboard_table(text), category,
-                           categories[category], source_url=source_url,
-                           season=observed.get('Season', UNKNOWN),
-                           collected_at_utc=collected, requested_filters=desired,
-                           verified_active_filters=observed, capture_id=capture_id,
-                           source_context=source_context or {})
+        rows = capture_rows(path, metadata)
         metadata.update(parse_status='parsed' if rows else 'empty', row_count=len(rows))
         return rows
-    except Exception as exc:
-        metadata.update(parse_status='failed', error=str(exc))
+    except BaseException as exc:
+        metadata.update(parse_status='failed', error=str(exc) or type(exc).__name__)
         raise
     finally:
-        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+        write_json(path, metadata)
+
+
+def preserve_capture(text, champion, category, directory, *, validation_error=None, **context):
+    path, metadata = begin_capture(text, champion, category, directory, **context)
+    return finish_capture(path, metadata, validation_error)
+
+
+def export_captures(paths, output, *, overwrite=False):
+    """One run, one snapshot; never sum attempts or silently remove repeated rows."""
+    paths = list(paths)
+    run_ids, ids, headers = set(), set(), {}
+    for path in paths:
+        metadata = json.loads(path.read_text(encoding='utf-8'))
+        if metadata.get('run_id', UNKNOWN) == UNKNOWN:
+            raise ValueError('Cannot safely rebuild captures without a known run ID')
+        run_ids.add(metadata['run_id'])
+        if metadata['capture_id'] in ids:
+            raise ValueError('Duplicate capture ID; refusing duplicate import')
+        ids.add(metadata['capture_id'])
+        if metadata['parse_status'] not in ('parsed', 'empty'):
+            raise ValueError('Capture is not validated: ' + str(path))
+        capture_rows(path, metadata)  # Validate every capture before opening an Excel writer.
+        text = path.with_suffix('.txt').read_bytes().decode('utf-8')
+        columns = (next(csv.reader(io.StringIO(text), delimiter='\t'), [])
+                   if metadata['source_context'].get('verified_empty_table')
+                   else parse_clipboard_table(text).columns)
+        headers.update(dict.fromkeys(columns))
+    if len(run_ids) > 1:
+        raise ValueError('Cannot combine captures from different runs')
+    def records():
+        for path in paths:
+            yield from capture_rows(path, json.loads(path.read_text(encoding='utf-8')))
+    save_results(records(), output, overwrite=overwrite, source_headers=list(headers))
+
+
+def verified_context(state, controls):
+    verified = {'Selected champion': state['champion'], 'Game version': state['patch']}
+    for control in controls:
+        if control.get('id') in CONTROL_FIELDS and len(control.get('selected', [])) == 1:
+            selected = control['selected'][0]
+            verified[CONTROL_FIELDS[control['id']]] = selected['text'].strip()
+    # URL parameters are source evidence, not proof that a filter is active.
+    parameters = {}
+    for part in urlsplit(state['url']).path.split('/'):
+        key, separator, value = part.partition('-')
+        if separator and key in {'season','split','tournament','patch','role','league'}:
+            parameters[key] = unquote(value)
+    return verified, {'visible_selects': controls, 'url_parameters': parameters}
 
 
 def read_source_controls(driver):
@@ -453,18 +423,23 @@ def browser_state(driver):
           return e && e.selectedOptions.length ? e.selectedOptions[0].textContent.trim() : 'unknown';
         };
         const visible = e => e.getClientRects().length > 0;
-        const tables=[...document.querySelectorAll('table')].filter(visible);
-        const table=tables.find(t => [...t.querySelectorAll('th,td')].some(h =>
+        let table=window.golggObservedTable;
+        if (!table || !table.isConnected || !visible(table))
+          table=[...document.querySelectorAll('table')].filter(visible).find(t => [...t.querySelectorAll('th,td')].some(h =>
           /.+\\s+winrate/i.test(h.textContent.trim())));
         let rows=table ? [...table.querySelectorAll('tr')].map(r =>
           [...r.querySelectorAll(':scope > th, :scope > td')].map(c => c.textContent)) : [];
-        if (!window.golggTableObserver) {
-          window.golggRevision=0;
+        if (table && window.golggObservedTable !== table) {
+          if(window.golggTableObserver) window.golggTableObserver.disconnect();
+          window.golggObservedTable=table;
+          window.golggRevision=(window.golggRevision || 0)+1;
           window.golggTableObserver=new MutationObserver(() => window.golggRevision++);
-          tables.forEach(t => window.golggTableObserver.observe(t,{subtree:true,childList:true,characterData:true}));
+          window.golggTableObserver.observe(table,{subtree:true,childList:true,characterData:true});
         }
-        return {champion:selected('cbchampselect'), patch:selected('patch'), rows,
-          url:location.href, origin:performance.timeOrigin, revision:window.golggRevision,
+        const empty=!!(table && [...table.querySelectorAll('td')].some(c =>
+          /no (data|records|matching records)|no games/i.test(c.textContent.trim()) && c.colSpan > 1));
+        return {champion:selected('cbchampselect'), patch:selected('patch'), rows, empty,
+          url:location.href, origin:performance.timeOrigin, revision:window.golggRevision || 0,
           busy:document.readyState !== 'complete' || !!(window.jQuery && window.jQuery.active),
           category:[...document.querySelectorAll('a,button')].filter(visible).filter(e =>
             e.matches('.active,[aria-selected="true"]') || e.parentElement.matches('li.active'))
@@ -472,22 +447,23 @@ def browser_state(driver):
     """)
 
 
-def table_identity(state, champion, patch):
+def table_identity(state, champion, patch, category=None):
     return (not state['busy'] and normalize_name(state['champion']) == normalize_name(champion)
             and (patch is None or state['patch'] == patch) and bool(state['rows'])
+            and (category is None or category in state['category'])
             and any(normalize_name(h.strip()[:-8]) == normalize_name(champion)
                     for h in state['rows'][0] if h.strip().lower().endswith(' winrate')))
 
 
-def wait_table(driver, champion, patch, before=None, *, timeout=30):
+def wait_table(driver, champion, patch, before=None, *, timeout=30, category=None):
     deadline = time.monotonic() + timeout
     previous, stable_since = None, None
     while time.monotonic() < deadline:
         state = browser_state(driver)
         transition = before is None or any(state[k] != before[k] for k in
                                             ('url', 'origin', 'revision', 'rows', 'category'))
-        signature = json.dumps({k: state[k] for k in ('champion', 'patch', 'rows', 'url', 'category')})
-        if table_identity(state, champion, patch) and transition:
+        signature = json.dumps({k: state[k] for k in ('champion', 'patch', 'rows', 'url', 'category', 'empty')})
+        if table_identity(state, champion, patch, category) and transition:
             if signature != previous:
                 previous, stable_since = signature, time.monotonic()
             elif time.monotonic() - stable_since >= 2:
@@ -508,28 +484,88 @@ def change_control(driver, control_id, value, champion, patch):
 
 
 def clipboard_matches(text, state):
-    import csv
     copied = list(csv.reader(io.StringIO(text), delimiter='\t'))
     clean = lambda rows: [[' '.join(str(c).split()).casefold() for c in row] for row in rows]
-    return clean(copied) == clean(state['rows'])
+    return (clean(copied) == clean(state['rows']) or
+            (state.get('empty', False) and clean(copied) in ([], clean(state['rows'][:1]))))
+
+
+def collect_table(driver, champion, patch, category, directory, run_id, requested,
+                  *, confirm=False):
+    label = CATEGORY_LABELS[category]
+    before = browser_state(driver)
+    if label not in before['category']:
+        if not click_tab(driver, label):
+            raise RuntimeError('Aba não encontrada: ' + label)
+        state = wait_table(driver, champion, patch, before, category=label)
+    else:
+        state = wait_table(driver, champion, patch, category=label)
+    if confirm:
+        input(f'Confira {champion} / {patch} / {label} e pressione Enter...')
+        state = wait_table(driver, champion, patch, category=label)
+    controls = read_source_controls(driver)
+    verified, source_context = verified_context(state, controls)
+    verified['Matchup category'] = category
+    source_context['verified_empty_table'] = state.get('empty', False)
+    text = click_copy_table(driver)
+    # The very next operation persists the clipboard. All later failures have a
+    # pending/failed sidecar and raw text available for review/reprocessing.
+    path, metadata = begin_capture(text, champion, category, directory,
+        source_url=state['url'], verified=verified, requested=requested,
+        source_context=source_context, run_id=run_id)
+    try:
+        after = browser_state(driver)
+        if (not table_identity(after, champion, patch, label)
+                or any(state.get(k) != after.get(k) for k in ('rows', 'url', 'revision', 'origin', 'empty'))
+                or controls != read_source_controls(driver)
+                or not clipboard_matches(text, after)):
+            raise ValueError('Tabela/filtros mudaram durante a cópia ou clipboard divergente.')
+    except BaseException as exc:
+        metadata.update(parse_status='failed', error=str(exc) or type(exc).__name__)
+        write_json(path, metadata)
+        raise
+    rows = finish_capture(path, metadata)
+    return path, len(rows)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Collect champions and individual game versions; preserve raw data')
+    parser = argparse.ArgumentParser(description='Collect champions and individual patches; preserve original data')
     parser.add_argument('--output', default='golgg_champion_synergy_v2.xlsx')
     parser.add_argument('--captures-dir', default='golgg_raw_captures')
-    parser.add_argument('--champions', nargs='+', help='Default: all live champion options')
-    parser.add_argument('--versions', nargs='+', help='Example: --versions 16.20 16.18; default: all numbered patches')
-    parser.add_argument('--limit', type=int, default=None, help='Limit champions for a small test')
-    parser.add_argument('--start-url', default='https://gol.gg/', help='Open homepage for interactive login/navigation')
-    parser.add_argument('--confirm-tables', action='store_true', help='Also require visual confirmation for each table')
+    parser.add_argument('--champions', nargs='+')
+    parser.add_argument('--versions', nargs='+', help='Default: all numbered patches, excluding ALL')
+    parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--start-url', default='https://gol.gg/')
+    parser.add_argument('--confirm-tables', action='store_true')
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--rebuild-captures', metavar='DIRECTORY', help='Offline rebuild from one existing run')
+    parser.add_argument('--run-id', help='Required only with --rebuild-captures')
     args = parser.parse_args()
     if Path(args.output).exists() and not args.overwrite:
         parser.error('Output already exists; choose a new path or explicitly use --overwrite.')
+    if args.limit is not None and args.limit < 1:
+        parser.error('--limit must be positive')
+    if bool(args.rebuild_captures) != bool(args.run_id):
+        parser.error('--rebuild-captures and --run-id must be used together')
+    if args.rebuild_captures:
+        paths = []
+        for path in Path(args.rebuild_captures).glob('*.json'):
+            metadata = json.loads(path.read_text(encoding='utf-8'))
+            if metadata.get('run_id') == args.run_id:
+                if metadata['parse_status'] in ('parsed', 'empty'):
+                    paths.append(path)
+                else:
+                    print('Captura não validada, excluída da reconstrução:', path.name)
+        if not paths:
+            parser.error('No validated captures found for this run ID')
+        paths.sort(key=lambda p: json.loads(p.read_text(encoding='utf-8'))['collected_at_utc'])
+        export_captures(paths, args.output, overwrite=args.overwrite)
+        print('Reconstruído sem browser ou clipboard:', args.output)
+        return
     load_browser_dependencies()
     driver = init_driver(headless=False)
-    results = []
+    paths, run_id, complete = [], uuid.uuid4().hex, False
+    print('Run ID:', run_id, '| Originais:', Path(args.captures_dir).resolve())
     try:
         driver.get(args.start_url)
         input('Faça login, abra Champion Synergy, ajuste os demais filtros e pressione Enter...')
@@ -545,57 +581,30 @@ def main():
         if args.versions:
             versions = [(t,v) for t,v in versions if t in args.versions]
             if {t for t,v in versions} != set(args.versions):
-                raise ValueError('Versão solicitada não encontrada; ALL não é um patch individual.')
+                raise ValueError('Versão solicitada não encontrada; ALL não é patch individual.')
         if not champions or not versions:
             raise ValueError('Nenhum campeão ou patch individual disponível.')
+        initial = browser_state(driver)
+        baseline, _ = verified_context(initial, read_source_controls(driver))
+        total = len(champions) * len(versions) * len(CATEGORIES)
         print('Plano:', len(champions), 'campeões x', len(versions), 'patches x 3 categorias.')
+        # Keep the proven traversal order; changing it requires live measurements.
         for patch, patch_value in versions:
             for champion, champion_value in champions:
-                # Reacquire native controls after every navigation; site may reset
-                # the patch when switching champions, so always reapply it last.
                 change_control(driver, 'cbchampselect', champion_value, champion, None)
                 change_control(driver, 'patch', patch_value, champion, patch)
-                for category, label in [('Direct_Matchup','Direct Matchup'),
-                                        ('Indirect_Matchup','Indirect Matchup'), ('Ally_Synergy','Good with')]:
-                    before = browser_state(driver)
-                    if not click_tab(driver, label):
-                        raise RuntimeError('Aba não encontrada: ' + label)
-                    changed_tab = label not in before['category']
-                    state = wait_table(driver, champion, patch, before if changed_tab else None)
-                    if args.confirm_tables:
-                        input(f'Confira {champion} / {patch} / {label} e pressione Enter...')
-                        state = wait_table(driver, champion, patch)
-                    text = click_copy_table(driver)
-                    error = None
-                    try:
-                        after = wait_table(driver, champion, patch)
-                    except Exception as exc:
-                        after = state
-                        error = 'Falha ao reconfirmar a tabela após copiar: ' + str(exc)
-                    if state['rows'] != after['rows'] or state['url'] != after['url'] or not clipboard_matches(text, after):
-                        error = 'Clipboard não corresponde à tabela estável; original preservado para conferência.'
-                    verified = {'Selected champion': after['champion'], 'Game version': after['patch']}
-                    if label in after['category']:
-                        verified['Matchup category'] = category
-                    try:
-                        controls = {'visible_selects': read_source_controls(driver)}
-                    except Exception as exc:
-                        controls = {'visible_selects': UNKNOWN, 'error': str(exc)}
-                    try:
-                        rows = preserve_capture(text, champion, category, args.captures_dir,
-                            source_url=driver.current_url, verified=verified,
-                            requested={'Selected champion': champion, 'Game version': patch},
-                            source_context=controls, validation_error=error)
-                        results.extend(rows)
-                        print(champion, patch, label, ':', len(rows), 'linhas preservadas')
-                    except ValueError as exc:
-                        print('Falha de parsing/conferência; original preservado:', exc)
-                        raise
+                for category in CATEGORIES:
+                    requested = dict(baseline, **{'Selected champion': champion, 'Game version': patch})
+                    path, count = collect_table(driver, champion, patch, category,
+                        args.captures_dir, run_id, requested, confirm=args.confirm_tables)
+                    paths.append(path)
+                    print(f'[{len(paths)}/{total}] {champion} / {patch} / {CATEGORY_LABELS[category]}: {count} linhas')
+        complete = True
     finally:
-        # Save collected rows even when a later patch fails or the user stops.
         try:
-            save_results(results, args.output, overwrite=args.overwrite)
-            print('Resultados desta execução:', args.output)
+            export_captures(paths, args.output, overwrite=args.overwrite)
+            print('Coleta concluída.' if complete else 'Coleta interrompida; resultado parcial.')
+            print('Excel:', args.output, '| Capturas validadas:', len(paths), '| Run ID:', run_id)
         finally:
             driver.quit()
 
