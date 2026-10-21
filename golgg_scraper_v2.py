@@ -376,7 +376,7 @@ def apply_filters(driver):
 
 
 def preserve_capture(text, champion, category, directory, *, source_url=UNKNOWN,
-                     verified=None, requested=None, source_context=None):
+                     verified=None, requested=None, source_context=None, validation_error=None):
     """Persist untouched clipboard text and context before parsing.
 
     Failed parses keep both original files. No append/merge/deduplication occurs.
@@ -405,6 +405,8 @@ def preserve_capture(text, champion, category, directory, *, source_url=UNKNOWN,
     with metadata_path.open('x', encoding='utf-8') as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
     try:
+        if validation_error:
+            raise ValueError(validation_error)
         rows = parse_table(champion, parse_clipboard_table(text), category,
                            categories[category], source_url=source_url,
                            season=observed.get('Season', UNKNOWN),
@@ -434,69 +436,168 @@ def read_source_controls(driver):
     """)
 
 
+def option_pairs(options, *, patches=False):
+    """Read live options rather than a fixed champion/patch list. Exclude ALL."""
+    pairs = [(o.text.strip(), o.get_attribute('value')) for o in options
+             if o.is_enabled() and o.get_attribute('value') and
+             o.text.strip() and 'empty' not in o.text.casefold()]
+    if patches:
+        pairs = [(text, value) for text, value in pairs if re.fullmatch(r'\d+\.\d+', text)]
+    return pairs
+
+
+def browser_state(driver):
+    return driver.execute_script("""
+        const selected = id => {
+          const e=document.getElementById(id);
+          return e && e.selectedOptions.length ? e.selectedOptions[0].textContent.trim() : 'unknown';
+        };
+        const visible = e => e.getClientRects().length > 0;
+        const tables=[...document.querySelectorAll('table')].filter(visible);
+        const table=tables.find(t => [...t.querySelectorAll('th,td')].some(h =>
+          /.+\\s+winrate/i.test(h.textContent.trim())));
+        let rows=table ? [...table.querySelectorAll('tr')].map(r =>
+          [...r.querySelectorAll(':scope > th, :scope > td')].map(c => c.textContent)) : [];
+        if (!window.golggTableObserver) {
+          window.golggRevision=0;
+          window.golggTableObserver=new MutationObserver(() => window.golggRevision++);
+          tables.forEach(t => window.golggTableObserver.observe(t,{subtree:true,childList:true,characterData:true}));
+        }
+        return {champion:selected('cbchampselect'), patch:selected('patch'), rows,
+          url:location.href, origin:performance.timeOrigin, revision:window.golggRevision,
+          busy:document.readyState !== 'complete' || !!(window.jQuery && window.jQuery.active),
+          category:[...document.querySelectorAll('a,button')].filter(visible).filter(e =>
+            e.matches('.active,[aria-selected="true"]') || e.parentElement.matches('li.active'))
+            .map(e => e.textContent.trim())};
+    """)
+
+
+def table_identity(state, champion, patch):
+    return (not state['busy'] and normalize_name(state['champion']) == normalize_name(champion)
+            and (patch is None or state['patch'] == patch) and bool(state['rows'])
+            and any(normalize_name(h.strip()[:-8]) == normalize_name(champion)
+                    for h in state['rows'][0] if h.strip().lower().endswith(' winrate')))
+
+
+def wait_table(driver, champion, patch, before=None, *, timeout=30):
+    deadline = time.monotonic() + timeout
+    previous, stable_since = None, None
+    while time.monotonic() < deadline:
+        state = browser_state(driver)
+        transition = before is None or any(state[k] != before[k] for k in
+                                            ('url', 'origin', 'revision', 'rows', 'category'))
+        signature = json.dumps({k: state[k] for k in ('champion', 'patch', 'rows', 'url', 'category')})
+        if table_identity(state, champion, patch) and transition:
+            if signature != previous:
+                previous, stable_since = signature, time.monotonic()
+            elif time.monotonic() - stable_since >= 2:
+                return state
+        else:
+            previous, stable_since = None, None
+        time.sleep(.25)
+    raise RuntimeError('Tabela não confirmou campeão/patch e atualização estável; captura interrompida.')
+
+
+def change_control(driver, control_id, value, champion, patch):
+    before = browser_state(driver)
+    control = Select(driver.find_element(By.ID, control_id))
+    changed = control.first_selected_option.get_attribute('value') != value
+    if changed:
+        control.select_by_value(value)
+    return wait_table(driver, champion, patch, before if changed else None)
+
+
+def clipboard_matches(text, state):
+    import csv
+    copied = list(csv.reader(io.StringIO(text), delimiter='\t'))
+    clean = lambda rows: [[' '.join(str(c).split()).casefold() for c in row] for row in rows]
+    return clean(copied) == clean(state['rows'])
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Preserve gol.gg tables and original clipboard captures')
-    parser.add_argument('--output', default='golgg_champion_synergy_v2.xlsx', help='New Excel output file')
-    parser.add_argument('--captures-dir', default='golgg_raw_captures', help='Directory for unique UTF-8 captures and metadata')
-    parser.add_argument('--limit', type=int, default=None)
-    parser.add_argument('--champions', nargs='*', default=None)
-    parser.add_argument('--overwrite', action='store_true', help='Explicitly allow replacing output')
+    parser = argparse.ArgumentParser(description='Collect champions and individual game versions; preserve raw data')
+    parser.add_argument('--output', default='golgg_champion_synergy_v2.xlsx')
+    parser.add_argument('--captures-dir', default='golgg_raw_captures')
+    parser.add_argument('--champions', nargs='+', help='Default: all live champion options')
+    parser.add_argument('--versions', nargs='+', help='Example: --versions 16.20 16.18; default: all numbered patches')
+    parser.add_argument('--limit', type=int, default=None, help='Limit champions for a small test')
+    parser.add_argument('--start-url', default='https://gol.gg/', help='Open homepage for interactive login/navigation')
+    parser.add_argument('--confirm-tables', action='store_true', help='Also require visual confirmation for each table')
+    parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
     if Path(args.output).exists() and not args.overwrite:
         parser.error('Output already exists; choose a new path or explicitly use --overwrite.')
     load_browser_dependencies()
     driver = init_driver(headless=False)
+    results = []
     try:
-        driver.get(BASE_URL.format(season=SEASON, split=SPLIT, tournament=TOURNAMENT))
-        print('Faça login e ajuste os filtros manualmente. Solicitados:', REQUESTED_FILTERS)
-        input('Quando estiver logado e a página carregada, pressione Enter...')
-        print('Filtros não verificados são registrados como unknown, nunca como ALL.')
-        champions = args.champions or get_champion_list(driver)
+        driver.get(args.start_url)
+        input('Faça login, abra Champion Synergy, ajuste os demais filtros e pressione Enter...')
+        champions = option_pairs(Select(driver.find_element(By.ID, 'cbchampselect')).options)
+        if args.champions:
+            wanted = {normalize_name(c) for c in args.champions}
+            champions = [(t,v) for t,v in champions if normalize_name(t) in wanted]
+            if {normalize_name(t) for t,v in champions} != wanted:
+                raise ValueError('Campeão solicitado não encontrado no seletor.')
         if args.limit is not None:
             champions = champions[:args.limit]
-        results = []
-        for champ in champions:
-            verified_champion = UNKNOWN
-            try:
-                select = find_champion_select(driver)
-                Select(select).select_by_visible_text(champ)
-                time.sleep(1.5)
-                actual = Select(find_champion_select(driver)).first_selected_option.text
-                if normalize_name(actual) == normalize_name(champ):
-                    verified_champion = actual
-            except Exception:
-                if not select_champion_custom(driver, champ):
-                    print('Não foi possível selecionar:', champ)
-                    continue
-            for category, label in [('Direct_Matchup', 'Direct Matchup'),
-                                    ('Indirect_Matchup', 'Indirect Matchup'),
-                                    ('Ally_Synergy', 'Good with')]:
-                if not click_tab(driver, label):
-                    print('Aba não encontrada:', champ, label)
-                    continue
-                # Live DOM/update signals are unverified. Preserve the interactive
-                # workflow and require visual confirmation rather than pretend a
-                # fixed sleep proves that an asynchronous table has finished.
-                input(f'Confira {champ} / {label}, aguarde a atualização da tabela e pressione Enter para copiar...')
-                try:
+        versions = option_pairs(Select(driver.find_element(By.ID, 'patch')).options, patches=True)
+        if args.versions:
+            versions = [(t,v) for t,v in versions if t in args.versions]
+            if {t for t,v in versions} != set(args.versions):
+                raise ValueError('Versão solicitada não encontrada; ALL não é um patch individual.')
+        if not champions or not versions:
+            raise ValueError('Nenhum campeão ou patch individual disponível.')
+        print('Plano:', len(champions), 'campeões x', len(versions), 'patches x 3 categorias.')
+        for patch, patch_value in versions:
+            for champion, champion_value in champions:
+                # Reacquire native controls after every navigation; site may reset
+                # the patch when switching champions, so always reapply it last.
+                change_control(driver, 'cbchampselect', champion_value, champion, None)
+                change_control(driver, 'patch', patch_value, champion, patch)
+                for category, label in [('Direct_Matchup','Direct Matchup'),
+                                        ('Indirect_Matchup','Indirect Matchup'), ('Ally_Synergy','Good with')]:
+                    before = browser_state(driver)
+                    if not click_tab(driver, label):
+                        raise RuntimeError('Aba não encontrada: ' + label)
+                    changed_tab = label not in before['category']
+                    state = wait_table(driver, champion, patch, before if changed_tab else None)
+                    if args.confirm_tables:
+                        input(f'Confira {champion} / {patch} / {label} e pressione Enter...')
+                        state = wait_table(driver, champion, patch)
                     text = click_copy_table(driver)
+                    error = None
+                    try:
+                        after = wait_table(driver, champion, patch)
+                    except Exception as exc:
+                        after = state
+                        error = 'Falha ao reconfirmar a tabela após copiar: ' + str(exc)
+                    if state['rows'] != after['rows'] or state['url'] != after['url'] or not clipboard_matches(text, after):
+                        error = 'Clipboard não corresponde à tabela estável; original preservado para conferência.'
+                    verified = {'Selected champion': after['champion'], 'Game version': after['patch']}
+                    if label in after['category']:
+                        verified['Matchup category'] = category
                     try:
                         controls = {'visible_selects': read_source_controls(driver)}
                     except Exception as exc:
-                        controls = {'visible_selects': UNKNOWN, 'read_error': str(exc)}
-                    rows = preserve_capture(text, champ, category, args.captures_dir,
-                                            source_url=driver.current_url,
-                                            verified={'Selected champion': verified_champion},
-                                            source_context=controls)
-                    results.extend(rows)
-                    print('Captura preservada:', champ, label, len(rows), 'linhas; filtros não verificados.')
-                except Exception as exc:
-                    print('Falha na captura/parsing:', champ, label, str(exc))
-                    print('Se houve texto copiado, o original e o erro permanecem em', args.captures_dir)
-        save_results(results, args.output, overwrite=args.overwrite)
-        print('Salvo em', args.output)
+                        controls = {'visible_selects': UNKNOWN, 'error': str(exc)}
+                    try:
+                        rows = preserve_capture(text, champion, category, args.captures_dir,
+                            source_url=driver.current_url, verified=verified,
+                            requested={'Selected champion': champion, 'Game version': patch},
+                            source_context=controls, validation_error=error)
+                        results.extend(rows)
+                        print(champion, patch, label, ':', len(rows), 'linhas preservadas')
+                    except ValueError as exc:
+                        print('Falha de parsing/conferência; original preservado:', exc)
+                        raise
     finally:
-        driver.quit()
+        # Save collected rows even when a later patch fails or the user stops.
+        try:
+            save_results(results, args.output, overwrite=args.overwrite)
+            print('Resultados desta execução:', args.output)
+        finally:
+            driver.quit()
 
 
 if __name__ == '__main__':
