@@ -474,13 +474,13 @@ def wait_table(driver, champion, patch, before=None, *, timeout=30, category=Non
     raise RuntimeError('Tabela não confirmou campeão/patch e atualização estável; captura interrompida.')
 
 
-def change_control(driver, control_id, value, champion, patch):
+def change_control(driver, control_id, value, champion, patch, *, timeout=60):
     before = browser_state(driver)
     control = Select(driver.find_element(By.ID, control_id))
     changed = control.first_selected_option.get_attribute('value') != value
     if changed:
         control.select_by_value(value)
-    return wait_table(driver, champion, patch, before if changed else None)
+    return wait_table(driver, champion, patch, before if changed else None, timeout=timeout)
 
 
 def clipboard_matches(text, state):
@@ -491,19 +491,22 @@ def clipboard_matches(text, state):
 
 
 def collect_table(driver, champion, patch, category, directory, run_id, requested,
-                  *, confirm=False):
+                  *, confirm=False, timeout=60, completed=None):
     label = CATEGORY_LABELS[category]
     before = browser_state(driver)
     if label not in before['category']:
         if not click_tab(driver, label):
             raise RuntimeError('Aba não encontrada: ' + label)
-        state = wait_table(driver, champion, patch, before, category=label)
+        state = wait_table(driver, champion, patch, before, category=label, timeout=timeout)
     else:
-        state = wait_table(driver, champion, patch, category=label)
+        state = wait_table(driver, champion, patch, category=label, timeout=timeout)
     if confirm:
         input(f'Confira {champion} / {patch} / {label} e pressione Enter...')
-        state = wait_table(driver, champion, patch, category=label)
+        state = wait_table(driver, champion, patch, category=label, timeout=timeout)
     controls = read_source_controls(driver)
+    if completed:
+        assert_resume_context(completed, state, controls)
+        assert_category_context(completed, category, controls)
     verified, source_context = verified_context(state, controls)
     verified['Matchup category'] = category
     source_context['verified_empty_table'] = state.get('empty', False)
@@ -528,6 +531,147 @@ def collect_table(driver, champion, patch, category, directory, run_id, requeste
     return path, len(rows)
 
 
+def capture_key(metadata):
+    return (normalize_name(metadata['requested']['Selected champion']),
+            metadata['verified'].get('Game version', UNKNOWN),
+            metadata['requested']['Matchup category'])
+
+
+class CaptureIndex(dict):
+    """Cache distinct source contexts, avoiding repeated disk reads per table."""
+    def __init__(self):
+        super().__init__()
+        self.sources = {}
+
+    def remember(self, metadata):
+        source = metadata['source_context']
+        profile = dict(source)
+        profile['visible_selects'] = [c for c in source.get('visible_selects', [])
+                                     if c['id'] not in ('cbchampselect', 'patch')]
+        profile['url_parameters'] = {k:v for k,v in source.get('url_parameters', {}).items() if k != 'patch'}
+        profile.pop('verified_empty_table', None)
+        key = (metadata['requested']['Matchup category'], json.dumps(profile, sort_keys=True))
+        self.sources[key] = (metadata['requested']['Matchup category'], profile)
+
+
+def saved_contexts(completed):
+    if isinstance(completed, CaptureIndex):
+        yield from completed.sources.values()
+    else:
+        for path in completed.values():
+            metadata = json.loads(path.read_text(encoding='utf-8'))
+            yield metadata['requested']['Matchup category'], metadata['source_context']
+
+
+def resume_captures(directory, run_id):
+    """Only validated, intact captures from this run can suppress a new capture."""
+    completed = CaptureIndex()
+    for path in Path(directory).glob('*.json'):
+        metadata = json.loads(path.read_text(encoding='utf-8'))
+        if metadata.get('run_id') != run_id or 'capture_id' not in metadata:
+            continue
+        if metadata.get('parse_status') not in ('parsed', 'empty'):
+            print('Captura pendente/falha será tentada novamente:', path.name)
+            continue
+        if not metadata.get('raw_sha256'):
+            raise ValueError('Captura sem checksum; não pode ser pulada com segurança: ' + str(path))
+        rows = capture_rows(path, metadata)
+        if len(rows) != metadata.get('row_count'):
+            raise ValueError('Contagem divergente na captura: ' + str(path))
+        key = capture_key(metadata)
+        if key in completed:
+            raise ValueError('Capturas concluídas repetidas para a mesma combinação; confira os originais.')
+        completed[key] = path
+        completed.remember(metadata)
+    if not completed:
+        raise ValueError('Nenhuma captura validada encontrada para esse Run ID nessa pasta.')
+    return completed
+
+
+def assert_resume_context(completed, state, controls):
+    """Compare preserved source evidence, not guessed meanings of URL parameters."""
+    _, current = verified_context(state, controls)
+    current_url = current['url_parameters']
+    current_selects = {c['id']: c['selected'] for c in controls}
+    checked = set()
+    for _, source in saved_contexts(completed):
+        # patch and champion deliberately change during traversal; other URL
+        # filters must agree with the prior run, including league/role if saved.
+        saved_url = {k:v for k,v in source.get('url_parameters', {}).items() if k != 'patch'}
+        signature = json.dumps(saved_url, sort_keys=True)
+        if signature not in checked:
+            for key, value in saved_url.items():
+                if current_url.get(key, UNKNOWN) != value:
+                    raise ValueError(f'Contexto diferente: {key} anterior={value}, atual={current_url.get(key, UNKNOWN)}. Ajuste a página antes de retomar.')
+            checked.add(signature)
+        for control in source.get('visible_selects', []):
+            if control['id'] in ('cbchampselect', 'patch', 'pickfilter'):
+                continue  # Pick Selection is category-specific; checked before capture.
+            if current_selects.get(control['id']) != control['selected']:
+                raise ValueError('Filtro diferente ou indisponível: ' + control['id'])
+
+
+def assert_category_context(completed, category, controls):
+    current = {c['id']: c['selected'] for c in controls}
+    for saved_category, source in saved_contexts(completed):
+        if saved_category != category:
+            continue
+        for control in source.get('visible_selects', []):
+            if control['id'] in ('rolefilter', 'pickfilter') and current.get(control['id']) != control['selected']:
+                raise ValueError('Filtro da tabela mudou: ' + control['id'])
+
+
+def replace_export(paths, output, *, overwrite=False, backup=False):
+    """Build completely first; preserve the old workbook before atomic replacement."""
+    import shutil
+    output = Path(output)
+    if output.exists() and not overwrite:
+        raise FileExistsError('Output already exists: ' + str(output))
+    temporary = output.with_name(output.stem + '.' + uuid.uuid4().hex + '.tmp.xlsx')
+    try:
+        export_captures(paths, temporary)
+        if output.exists():
+            if not overwrite:
+                raise FileExistsError('Output appeared during export: ' + str(output))
+            if backup:
+                backup_path = output.with_name(output.stem + '.backup-' +
+                    datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8] + output.suffix)
+                shutil.copy2(output, backup_path)
+                print('Backup do Excel anterior:', backup_path)
+            os.replace(temporary, output)
+        else:
+            # Exclusive creation protects against a concurrent output appearing.
+            with output.open('xb') as target, temporary.open('rb') as source:
+                shutil.copyfileobj(source, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def collect_with_retries(driver, champion, patch, category, directory, run_id, requested,
+                         *, completed, attempts=3, timeout=60, confirm=False):
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, attempts + 1):
+        try:
+            return collect_table(driver, champion, patch, category, directory, run_id,
+                                 requested, confirm=confirm, timeout=timeout * attempt,
+                                 completed=completed)
+        except RuntimeError as exc:
+            # A fresh read/reselection is attempted with more time. Parsing and
+            # context mismatches are ValueErrors and must not be bypassed.
+            try:
+                state = browser_state(driver)
+            except Exception as read_error:
+                state = {'read_error': str(read_error)}
+            diagnostic = Path(directory) / ('diagnostic-' + uuid.uuid4().hex + '.json')
+            write_json(diagnostic, {'run_id':run_id, 'champion':champion, 'patch':patch,
+                'category':category, 'attempt':attempt, 'error':str(exc), 'state':state,
+                'collected_at_utc':datetime.now(timezone.utc).isoformat()})
+            print(f'Falha de atualização ({attempt}/{attempts}): {exc}. Diagnóstico: {diagnostic.name}')
+            if attempt == attempts:
+                raise
+            time.sleep(2 * attempt)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Collect champions and individual patches; preserve original data')
     parser.add_argument('--output', default='golgg_champion_synergy_v2.xlsx')
@@ -540,9 +684,16 @@ def main():
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--rebuild-captures', metavar='DIRECTORY', help='Offline rebuild from one existing run')
     parser.add_argument('--run-id', help='Required only with --rebuild-captures')
+    parser.add_argument('--resume-run', metavar='RUN_ID', help='Resume validated captures in --captures-dir')
+    parser.add_argument('--timeout', type=int, default=60, help='Initial table timeout in seconds')
+    parser.add_argument('--attempts', type=int, default=3, help='Bounded attempts for table update failures')
     args = parser.parse_args()
-    if Path(args.output).exists() and not args.overwrite:
+    if Path(args.output).exists() and not (args.overwrite or args.resume_run):
         parser.error('Output already exists; choose a new path or explicitly use --overwrite.')
+    if args.timeout < 1 or args.attempts < 1:
+        parser.error('--timeout and --attempts must be positive')
+    if args.resume_run and (args.rebuild_captures or args.champions or args.versions or args.limit is not None):
+        parser.error('--resume-run must use the full original plan; do not combine with collection limits/rebuild')
     if args.limit is not None and args.limit < 1:
         parser.error('--limit must be positive')
     if bool(args.rebuild_captures) != bool(args.run_id):
@@ -551,7 +702,7 @@ def main():
         paths = []
         for path in Path(args.rebuild_captures).glob('*.json'):
             metadata = json.loads(path.read_text(encoding='utf-8'))
-            if metadata.get('run_id') == args.run_id:
+            if metadata.get('run_id') == args.run_id and 'capture_id' in metadata:
                 if metadata['parse_status'] in ('parsed', 'empty'):
                     paths.append(path)
                 else:
@@ -562,13 +713,20 @@ def main():
         export_captures(paths, args.output, overwrite=args.overwrite)
         print('Reconstruído sem browser ou clipboard:', args.output)
         return
+    completed = resume_captures(args.captures_dir, args.resume_run) if args.resume_run else CaptureIndex()
+    paths = list(completed.values())
+    original_count = len(paths)
+    run_id, complete, context_valid = args.resume_run or uuid.uuid4().hex, False, not bool(args.resume_run)
+    if completed:
+        print('Retomada: capturas validadas que serão puladas:', len(paths))
     load_browser_dependencies()
     driver = init_driver(headless=False)
-    paths, run_id, complete = [], uuid.uuid4().hex, False
     print('Run ID:', run_id, '| Originais:', Path(args.captures_dir).resolve())
     try:
         driver.get(args.start_url)
-        input('Faça login, abra Champion Synergy, ajuste os demais filtros e pressione Enter...')
+        if args.resume_run:
+            print('Retomada: mantenha também os filtros anteriores de ligas, role da página e mínimo de jogos; esses controles não estavam verificados na coleta antiga.')
+        input('Faça login, abra Champion Synergy, ajuste os mesmos filtros e pressione Enter...')
         champions = option_pairs(Select(driver.find_element(By.ID, 'cbchampselect')).options)
         if args.champions:
             wanted = {normalize_name(c) for c in args.champions}
@@ -585,24 +743,41 @@ def main():
         if not champions or not versions:
             raise ValueError('Nenhum campeão ou patch individual disponível.')
         initial = browser_state(driver)
-        baseline, _ = verified_context(initial, read_source_controls(driver))
+        controls = read_source_controls(driver)
+        if completed:
+            assert_resume_context(completed, initial, controls)
+        context_valid = True
+        baseline, _ = verified_context(initial, controls)
         total = len(champions) * len(versions) * len(CATEGORIES)
         print('Plano:', len(champions), 'campeões x', len(versions), 'patches x 3 categorias.')
+        plan_keys = {(normalize_name(c), p, k) for c,_ in champions for p,_ in versions for k in CATEGORIES}
+        if not set(completed).issubset(plan_keys):
+            context_valid = False
+            raise ValueError('O plano atual não contém todas as combinações anteriores; confira season e opções.')
+        print('Já validadas:', len(paths), '| Restantes:', total - len(paths))
         # Keep the proven traversal order; changing it requires live measurements.
         for patch, patch_value in versions:
             for champion, champion_value in champions:
-                change_control(driver, 'cbchampselect', champion_value, champion, None)
-                change_control(driver, 'patch', patch_value, champion, patch)
-                for category in CATEGORIES:
+                pending = [k for k in CATEGORIES if (normalize_name(champion), patch, k) not in completed]
+                if not pending:
+                    continue
+                change_control(driver, 'cbchampselect', champion_value, champion, None, timeout=args.timeout)
+                change_control(driver, 'patch', patch_value, champion, patch, timeout=args.timeout)
+                for category in pending:
                     requested = dict(baseline, **{'Selected champion': champion, 'Game version': patch})
-                    path, count = collect_table(driver, champion, patch, category,
-                        args.captures_dir, run_id, requested, confirm=args.confirm_tables)
+                    path, count = collect_with_retries(driver, champion, patch, category,
+                        args.captures_dir, run_id, requested, confirm=args.confirm_tables,
+                        completed=completed, attempts=args.attempts, timeout=args.timeout)
                     paths.append(path)
+                    completed[(normalize_name(champion), patch, category)] = path
+                    completed.remember(json.loads(path.read_text(encoding='utf-8')))
                     print(f'[{len(paths)}/{total}] {champion} / {patch} / {CATEGORY_LABELS[category]}: {count} linhas')
         complete = True
     finally:
         try:
-            export_captures(paths, args.output, overwrite=args.overwrite)
+            if context_valid and (len(paths) > original_count or not Path(args.output).exists()):
+                replace_export(paths, args.output, overwrite=args.overwrite or bool(args.resume_run),
+                               backup=bool(args.resume_run))
             print('Coleta concluída.' if complete else 'Coleta interrompida; resultado parcial.')
             print('Excel:', args.output, '| Capturas validadas:', len(paths), '| Run ID:', run_id)
         finally:
