@@ -231,9 +231,66 @@ def compare_drafts(database, blue, red, *, patch=None, run_id=None, weights=None
     denominator = blue_score + red_score if blue_score is not None and red_score is not None else None
     relative = {'blue':blue_score/denominator*100,'red':red_score/denominator*100} if denominator and denominator > 0 else None
     return {'run_id':metadata['run_id'], 'patch':patch, 'patches_used':metadata['patches'] if patch is None else [patch],
+            'drafts':{'blue':list(blue),'red':list(red)},
             'aggregation':'all_available_patches' if patch is None else 'single_patch_audit', 'weights':weights, 'teams':teams,
             'relative_indicator':relative,
             'note':'Indicador experimental, não probabilidade calibrada. Somas de Games de relações não são partidas independentes. Sem redistribuição automática de pesos de componentes ausentes.'}
+
+
+def explain_comparison(result, large_gap=10):
+    """Exact additive decomposition of the indicator, not causal feature effects.
+
+    50% is only the algebraic reference for observed relations. Missing rows are
+    never assigned that value. Contributions across available sides cancel this
+    reference when both components are usable.
+    """
+    relative = result['relative_indicator']
+    gap = relative['blue'] - relative['red'] if relative else None
+    leader = ('blue' if gap > 0 else 'red' if gap < 0 else 'tie') if gap is not None else None
+    scores = [result['teams'][side]['score'] for side in ('blue','red')]
+    total = sum(scores) if all(score is not None for score in scores) else None
+    factor = 100 / total if total and total > 0 else None
+    components, relations, alerts = [], [], []
+    for category, weight in result['weights'].items():
+        blue = result['teams']['blue']['components'][category]
+        red = result['teams']['red']['components'][category]
+        delta = weight * (blue['score'] - red['score']) if blue['score'] is not None and red['score'] is not None else None
+        components.append({'category':category, 'weight':weight,
+            'blue_score':blue['score'], 'red_score':red['score'],
+            'score_gap_contribution':delta,
+            'indicator_gap_contribution':delta * factor if delta is not None and factor is not None else None})
+        for side, component, sign in [('blue',blue,1),('red',red,-1)]:
+            if component['missing_pairs']:
+                alerts.append({'type':'missing_pairs','side':side,'category':category,
+                    'found':component['found_pairs'],'queried':component['queried_pairs']})
+            if component['score'] is None and weight > 0:
+                alerts.append({'type':'unavailable_component','side':side,'category':category})
+            denominator = component['relation_games_sum']
+            if weight <= 0 or not denominator or component['score'] is None:
+                continue
+            for detail in component['details']:
+                if detail['winrate'] is None:
+                    continue
+                contribution = sign * weight * detail['games'] / denominator * (detail['winrate'] - .5) * 100
+                relations.append({'side':side,'category':category,'first':detail['first'],'second':detail['second'],
+                    'games':detail['games'],'winrate':detail['winrate'],
+                    'component_share':detail['games']/denominator,
+                    'score_gap_contribution':contribution,
+                    'indicator_gap_contribution':contribution * factor if factor is not None else None,
+                    'patch_count':len(detail.get('patch_sources',[]))})
+    relations.sort(key=lambda row: abs(row['score_gap_contribution']),reverse=True)
+    for relation in relations[:5]:
+        if relation['games'] <= 2:
+            alerts.append({'type':'small_sample_influential_relation','relation':relation})
+        if relation['component_share'] >= .5:
+            alerts.append({'type':'concentrated_component','relation':relation})
+    direction = 1 if leader == 'blue' else -1 if leader == 'red' else 0
+    supporting = [r for r in relations if direction * r['score_gap_contribution'] > 0][:3]
+    opposing = [r for r in relations if direction * r['score_gap_contribution'] < 0][:3]
+    return {'leader':leader,'indicator_gap':gap,'large_gap':abs(gap) >= large_gap if gap is not None else None,
+            'large_gap_threshold':large_gap,'components':components,'relations':relations,
+            'supporting_relations':supporting,'opposing_relations':opposing,'alerts':alerts,
+            'method':'Contribuições aditivas ao cálculo. Sinal positivo favorece azul; negativo favorece vermelho. Não são efeitos causais nem probabilidades independentes. O limiar de grande disparidade é apenas visual.'}
 
 
 def main():

@@ -11,7 +11,7 @@ No PowerShell:
 
 ```powershell
 cd D:\Importacao_s16
-& "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" -m pip install streamlit
+& "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" -m pip install --upgrade streamlit
 & "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" -m streamlit run .\app_draft_sqlite.py
 ```
 
@@ -95,3 +95,48 @@ contextos misturados, isolamento de snapshots/patches e independência do GD@15.
 Também foi feito teste com a cópia real importada, incluindo execução da interface
 pelo AppTest do Streamlit. São testes funcionais, não avaliação da capacidade
 preditiva em partidas futuras.
+
+
+## Explicações e registro de análises
+
+A nova interface reorganiza o trabalho em seleção do draft, resumo do resultado,
+explicação, evidências e anotações. A barra lateral guarda a conexão e os critérios.
+Um gráfico de barras mostra as contribuições dos componentes à diferença azul −
+vermelho. Azul/positivo favorece o azul; vermelho/negativo favorece o vermelho.
+
+A diferença dos scores é decomposta exatamente por categoria:
+`peso * (score_azul - score_vermelho)`. Para expressar as contribuições na escala
+do indicador relativo, multiplica-se por `100 / (score_azul + score_vermelho)`.
+Dentro do componente, a contribuição de cada relação usa seu peso por Games e
+uma referência algébrica de 50%. Não se preenchem relações ausentes com 50%.
+Essa decomposição reconstrói a diferença observada; não mede o efeito de remover
+um campeão e não demonstra causalidade ou força real independente das relações.
+As categorias podem compartilhar jogos; as contribuições são aritméticas.
+
+O relatório destaca os componentes e relações que favorecem o líder, contrapontos,
+ausências, relações influentes com até dois Games e concentração de um componente
+em uma relação. Por padrão, uma diferença >=10 p.p. recebe destaque visual de
+disparidade; o limiar é configurável e não é uma regra de confiança estatística.
+Sem indicador final, não são inventados líder ou contribuições comparáveis.
+
+Cada clique em Analisar e registrar cria uma entrada com nome, drafts, Run ID,
+patches, pesos, horário UTC, resultado e explicação. As anotações pessoais são
+salvas no registro somente ao clicar Registrar anotações. O histórico fica na
+sessão Streamlit, não é escrito no SQLite e não é restaurado automaticamente.
+Baixe o JSON, relatório Markdown ou histórico JSON antes de fechar/reiniciar o app.
+O registro exportado inclui os dados utilizados no cálculo e a origem por patch.
+A interface identifica quando as configurações exibidas diferem do registro aberto.
+
+Consultas idênticas usam cache vinculado ao caminho, tamanho e data de modificação
+do SQLite e aos parâmetros do cálculo. Não é necessário importar os dados outra vez.
+A interface atual usa Streamlit recente; atualize com o comando de instalação acima.
+
+Testes adicionais:
+
+```sh
+python -m unittest discover -s tests -p test_explicacoes_draft.py -v
+```
+
+Incluem reconstrução exata da diferença por componentes e relações, normalização
+com denominador diferente de 100, sinais/líder, empates, limiar visual e falta de
+componentes. A interface também foi exercitada com a base real e anotações em sessão.
