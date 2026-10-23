@@ -118,6 +118,45 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(isolated[('Direct_Matchup','a','f')].games,10)
             self.assertAlmostEqual(model.compare_drafts(db,BLUE,RED,patch='16.10',run_id='run-a')['relative_indicator']['blue'],76)
 
+    def test_all_patches_default_weighted_roles_and_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);db=self.database(root)
+            second=root/'second';second.mkdir()
+            importer.import_directory(make_source(second,patch='16.11'),db,append=True)
+            con=sqlite3.connect(db)
+            first_id=con.execute("SELECT capture_id FROM capturas WHERE selected_champion='A' AND category='Direct_Matchup' AND patch_verified='16.10'").fetchone()[0]
+            second_id=con.execute("SELECT capture_id FROM capturas WHERE selected_champion='A' AND category='Direct_Matchup' AND patch_verified='16.11'").fetchone()[0]
+            con.execute("UPDATE registros SET games=10,winrate=.49 WHERE capture_id=? AND related_champion='F'",(first_id,))
+            con.execute('INSERT INTO registros VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (first_id,99,'F','F','MID',3,.55,None,None,None,None,'{}'))
+            con.execute("UPDATE registros SET games=20,winrate=.8 WHERE capture_id=? AND related_champion='F'",(second_id,))
+            con.commit();con.close();before=db.read_bytes()
+            pair=model.load_pairs(db,'run-a')[('Direct_Matchup','a','f')]
+            self.assertEqual(pair.games,33)
+            self.assertAlmostEqual(pair.winrate,(10*.49+3*.55+20*.8)/33)
+            self.assertEqual({p['patch']:p['games'] for p in model.patch_sources(pair)},{'16.10':13,'16.11':20})
+            result=model.compare_drafts(db,BLUE,RED)
+            self.assertEqual(result['aggregation'],'all_available_patches')
+            self.assertEqual(set(result['patches_used']),{'16.10','16.11'})
+            self.assertIsNone(result['patch'])
+            self.assertEqual(db.read_bytes(),before)
+
+    def test_synergy_selects_one_direction_per_patch_before_combining(self):
+        def pair(first,second,patch,games,rate):
+            p=model.Pair(first,second,'Ally_Synergy','ALL',games=games,weighted_rate_sum=games*rate)
+            p.by_patch[patch]={'games':games,'weighted_rate_sum':games*rate,'source_rows':1,
+                'missing_rows':0,'roles':{'TOP'},'selected':first,'related':second}
+            return p
+        pairs={('Ally_Synergy','a','b'):pair('A','B','16.10',10,.6),
+               ('Ally_Synergy','b','a'):pair('B','A','16.11',20,.4)}
+        component=model.component(pairs,['A','B'],[],'Ally_Synergy',1)
+        self.assertEqual(component['relation_games_sum'],30)
+        self.assertAlmostEqual(component['score'],(10*.6+20*.4)/30*100)
+        self.assertEqual(component,model.component(pairs,['B','A'],[],'Ally_Synergy',1))
+        pairs[('Ally_Synergy','b','a')].by_patch['16.10']=dict(pairs[('Ally_Synergy','b','a')].by_patch['16.11'],games=8,weighted_rate_sum=2)
+        combined=model.component(pairs,['A','B'],[],'Ally_Synergy',1)
+        self.assertEqual(combined['relation_games_sum'],30) # the reverse 8 is not added to 10
+
     def test_mixed_context_refused_and_bad_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             db=self.database(Path(directory));con=sqlite3.connect(db)

@@ -61,6 +61,7 @@ class Pair:
     source_rows: int = 0
     missing_rows: int = 0
     roles: set = field(default_factory=set)
+    by_patch: dict = field(default_factory=dict)
 
     @property
     def winrate(self):
@@ -77,8 +78,8 @@ def context_profile(source_json, verified_json):
     return json.dumps([parameters, controls, filters], sort_keys=True, ensure_ascii=False)
 
 
-def load_pairs(database, run_id, patch):
-    """Aggregate roles only within the same run, patch, category and context.
+def load_pairs(database, run_id, patch=None):
+    """Aggregate roles and individual patches within one run/category/context.
 
     Repeated rows for the same role are ambiguous and are rejected, never summed.
     Opposite directions and categories remain distinct.
@@ -86,39 +87,50 @@ def load_pairs(database, run_id, patch):
     connection = connect(database)
     pairs, profiles, seen = {}, {}, set()
     try:
-        captures = connection.execute('''SELECT category,source_context_json,verified_json FROM capturas
-            WHERE run_id=? AND patch_verified=?''', (run_id, patch)).fetchall()
+        clause = 'run_id=?' + (' AND patch_verified=?' if patch is not None else '')
+        parameters = (run_id, patch) if patch is not None else (run_id,)
+        captures = connection.execute('SELECT category,patch_verified,source_context_json,verified_json FROM capturas WHERE ' + clause, parameters).fetchall()
         if not captures:
             raise ValueError('Patch/execução sem capturas.')
         for capture in captures:
+            source_patch = capture['patch_verified']
+            if not source_patch or len(source_patch.split('.')) != 2 or not all(p.isdigit() for p in source_patch.split('.')):
+                raise ValueError('A base contém patch desconhecido/agregado; não somar com patches individuais.')
             category = capture['category']
             profile = context_profile(capture['source_context_json'], capture['verified_json'])
             if category in profiles and profiles[category] != profile:
                 raise ValueError(f'Contextos diferentes em {category}; selecione uma base homogênea.')
             profiles[category] = profile
-        rows = connection.execute('''SELECT c.selected_champion, c.category,
+        rows = connection.execute('''SELECT c.selected_champion, c.category, c.patch_verified,
             r.related_champion, r.source_role, r.games, r.winrate FROM capturas c
-            JOIN registros r USING(capture_id) WHERE c.run_id=? AND c.patch_verified=?''', (run_id, patch))
+            JOIN registros r USING(capture_id) WHERE ''' + 'c.' + clause.replace(' AND ', ' AND c.'), parameters)
         for row in rows:
             category = row['category']
             if category not in WEIGHTS:
                 continue
             key = (category, name_key(row['selected_champion']), name_key(row['related_champion']))
-            identity = (*key, row['source_role'])
+            identity = (*key, row['patch_verified'], row['source_role'])
             if identity in seen:
                 raise ValueError('Mais de uma linha para o mesmo par/role/contexto; não somar automaticamente.')
             seen.add(identity)
-            pair = pairs.setdefault(key, Pair(row['selected_champion'], row['related_champion'], category, patch))
+            pair = pairs.setdefault(key, Pair(row['selected_champion'], row['related_champion'], category, patch or 'ALL'))
+            part = pair.by_patch.setdefault(row['patch_verified'], {'games':0,'weighted_rate_sum':0.,'source_rows':0,
+                'missing_rows':0,'roles':set(),'selected':row['selected_champion'],'related':row['related_champion']})
+            part['source_rows'] += 1
+            part['roles'].add(row['source_role'])
             pair.source_rows += 1
             pair.roles.add(row['source_role'])
             games, rate = row['games'], row['winrate']
             if games is None or rate is None or games == 0:
                 pair.missing_rows += 1
+                part['missing_rows'] += 1
                 continue
             if games < 0 or not math.isfinite(rate) or not 0 <= rate <= 1:
                 raise ValueError('Valor inválido no banco.')
             pair.games += games
             pair.weighted_rate_sum += games * rate  # weighted arithmetic, not inferred exact wins
+            part['games'] += games
+            part['weighted_rate_sum'] += games * rate
         return pairs
     finally:
         connection.close()
@@ -132,15 +144,50 @@ def validate_draft(blue, red):
         raise ValueError('Informe dez campeões distintos e não vazios.')
 
 
+def synergy_pair(pairs, first, second):
+    """Pick one direction per patch, then combine patches without double count."""
+    category = 'Ally_Synergy'
+    options = [(k, pairs[k]) for k in ((category,name_key(first),name_key(second)),
+                                     (category,name_key(second),name_key(first))) if k in pairs]
+    parts = {}
+    for key, pair in options:
+        by_patch = pair.by_patch or {pair.patch: {'games':pair.games,'weighted_rate_sum':pair.weighted_rate_sum,
+            'source_rows':pair.source_rows,'missing_rows':pair.missing_rows,'roles':pair.roles,
+            'selected':pair.selected,'related':pair.related}}
+        for patch_name, part in by_patch.items():
+            if part['games'] > 0:
+                parts.setdefault(patch_name, []).append((key, part))
+    if not parts:
+        return None
+    combined = Pair(first, second, category, 'ALL')
+    for patch_name, choices in parts.items():
+        _, part = min(choices, key=lambda item: (-item[1]['games'], item[0]))
+        combined.by_patch[patch_name] = part
+        combined.games += part['games']
+        combined.weighted_rate_sum += part['weighted_rate_sum']
+        combined.source_rows += part['source_rows']
+        combined.missing_rows += part['missing_rows']
+        combined.roles.update(part['roles'])
+    return combined
+
+
+def patch_sources(pair):
+    if pair is None:
+        return []
+    return [{'patch':p, 'games':part['games'],
+             'winrate':part['weighted_rate_sum']/part['games'] if part['games'] else None,
+             'source_rows':part['source_rows'], 'roles':sorted(str(r) for r in part['roles']),
+             'selected_direction':part['selected'], 'related_direction':part['related']}
+            for p,part in sorted(pair.by_patch.items(), key=lambda item: tuple(int(x) for x in item[0].split('.')))]
+
+
 def component(pairs, team, opponents, category, minimum_games):
     candidates = list(itertools.combinations(sorted(team, key=name_key), 2)) if category == 'Ally_Synergy' else list(itertools.product(team, opponents))
     details = []
     for first, second in candidates:
         key = (category, name_key(first), name_key(second))
         if category == 'Ally_Synergy':
-            reverse = (category, name_key(second), name_key(first))
-            options = [(k, pairs[k]) for k in (key, reverse) if k in pairs and pairs[k].games > 0]
-            pair = min(options, key=lambda item: (-item[1].games, item[0]))[1] if options else None
+            pair = synergy_pair(pairs, first, second)
         else:
             pair = pairs.get(key)
         usable = pair is not None and pair.games > 0
@@ -150,7 +197,8 @@ def component(pairs, team, opponents, category, minimum_games):
                         'games': pair.games if usable else None,
                         'winrate': pair.winrate if usable else None,
                         'source_rows': pair.source_rows if pair else 0,
-                        'roles': sorted(str(r) for r in pair.roles) if pair else []})
+                        'roles': sorted(str(r) for r in pair.roles) if pair else [],
+                        'patch_sources': patch_sources(pair)})
     games = sum(d['games'] for d in details if d['games'] is not None)
     found = sum(d['winrate'] is not None for d in details)
     score = sum(d['games'] * d['winrate'] for d in details if d['winrate'] is not None) / games * 100 if games >= minimum_games and games else None
@@ -159,7 +207,7 @@ def component(pairs, team, opponents, category, minimum_games):
             'minimum_relation_games_sum': minimum_games, 'details': details}
 
 
-def compare_drafts(database, blue, red, *, patch, run_id=None, weights=None, minimum_games=10):
+def compare_drafts(database, blue, red, *, patch=None, run_id=None, weights=None, minimum_games=10):
     validate_draft(blue, red)
     weights = dict(WEIGHTS if weights is None else weights)
     if set(weights) != set(WEIGHTS) or any(not math.isfinite(v) or v < 0 for v in weights.values()) or not math.isclose(sum(weights.values()), 1):
@@ -167,7 +215,7 @@ def compare_drafts(database, blue, red, *, patch, run_id=None, weights=None, min
     if minimum_games < 1:
         raise ValueError('O mínimo deve ser positivo.')
     metadata = catalog(database, run_id)
-    if patch not in metadata['patches']:
+    if patch is not None and patch not in metadata['patches']:
         raise ValueError('Patch não disponível nesta execução.')
     known = {name_key(c) for c in metadata['champions']}
     if any(name_key(c) not in known for c in [*blue,*red]):
@@ -182,7 +230,8 @@ def compare_drafts(database, blue, red, *, patch, run_id=None, weights=None, min
     blue_score, red_score = teams['blue']['score'], teams['red']['score']
     denominator = blue_score + red_score if blue_score is not None and red_score is not None else None
     relative = {'blue':blue_score/denominator*100,'red':red_score/denominator*100} if denominator and denominator > 0 else None
-    return {'run_id':metadata['run_id'], 'patch':patch, 'weights':weights, 'teams':teams,
+    return {'run_id':metadata['run_id'], 'patch':patch, 'patches_used':metadata['patches'] if patch is None else [patch],
+            'aggregation':'all_available_patches' if patch is None else 'single_patch_audit', 'weights':weights, 'teams':teams,
             'relative_indicator':relative,
             'note':'Indicador experimental, não probabilidade calibrada. Somas de Games de relações não são partidas independentes. Sem redistribuição automática de pesos de componentes ausentes.'}
 
@@ -190,7 +239,7 @@ def compare_drafts(database, blue, red, *, patch, run_id=None, weights=None, min
 def main():
     parser=argparse.ArgumentParser(description='Comparador experimental de drafts, SQLite somente leitura')
     parser.add_argument('--database',required=True)
-    parser.add_argument('--patch',required=True)
+    parser.add_argument('--patch',help='Opcional: auditoria de um patch. Por padrão, agrega todos.')
     parser.add_argument('--run-id')
     parser.add_argument('--blue',required=True,help='Cinco campeões separados por vírgulas, sem ordem de posição')
     parser.add_argument('--red',required=True)

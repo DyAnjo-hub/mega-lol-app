@@ -14,8 +14,10 @@ try:
 except (ValueError,sqlite3.Error) as exc:
     st.info(f'Selecione um banco válido: {exc}')
     st.stop()
-patch=st.selectbox('Patch (somente este patch será usado)',options['patches'])
-st.caption('Sem ordem de posição. Roles diferentes do mesmo par são agregadas por Games dentro de cada categoria e patch.')
+st.caption(f"Histórico agregado: {len(options['patches'])} patches disponíveis, sem peso adicional por recência.")
+with st.expander('Patches de origem — rastreabilidade'):
+    st.write(', '.join(options['patches']))
+st.caption('Sem ordem de posição. Roles diferentes do mesmo par são agregadas por Games e todos os patches são reunidos dentro de cada categoria.')
 left,right=st.columns(2)
 with left:
     blue=st.multiselect('Time azul — cinco campeões',options['champions'],max_selections=5)
@@ -29,7 +31,7 @@ with st.expander('Pesos experimentais'):
 st.caption('O mínimo é uma regra operacional, não um limite validado de confiança. Gold/GD@15 e recência não entram no cálculo.')
 if st.button('Comparar drafts',type='primary'):
     try:
-        result=compare_drafts(database,blue,red,patch=patch,run_id=options['run_id'],minimum_games=int(minimum),
+        result=compare_drafts(database,blue,red,run_id=options['run_id'],minimum_games=int(minimum),
                               weights=dict(zip(WEIGHTS,(direct/100,indirect/100,synergy/100))))
     except (ValueError,sqlite3.Error) as exc:
         st.error(str(exc));st.stop()

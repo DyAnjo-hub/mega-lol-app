@@ -15,27 +15,27 @@ cd D:\Importacao_s16
 & "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" -m streamlit run .\app_draft_sqlite.py
 ```
 
-Escolha `mega_lol_s16.sqlite`, o patch e cinco campeões distintos por lado.
+Escolha `mega_lol_s16.sqlite`, cinco campeões distintos por lado. Todos os patches disponíveis são agregados automaticamente.
 Não há ordem de posições. Run ID fica vazio se o banco contém apenas uma execução;
 caso contrário, informe-o explicitamente. O browser é local, sem gol.gg ou login.
 
 Também é possível executar o modelo sem interface e sem pacotes externos:
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" .\modelo_draft_sqlite.py --database .\mega_lol_s16.sqlite --patch 16.10 --blue "Shen, Vi, Syndra, Smolder, Nautilus" --red "Vayne, Aatrox, Ahri, Sivir, Lulu"
+& "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" .\modelo_draft_sqlite.py --database .\mega_lol_s16.sqlite --blue "Shen, Vi, Syndra, Smolder, Nautilus" --red "Vayne, Aatrox, Ahri, Sivir, Lulu"
 ```
 
 ## Preparação da base: sem modificar dados preservados
 
-Roles diferentes são agregadas pelo mesmo par **direcionado**, categoria, patch,
-Run ID e contexto. A média é `SUM(Games * Winrate) / SUM(Games)`. Exemplo sintético:
-10 jogos a 49% e 3 jogos a 55% produzem 13 Games agregados e 50,3846%.
+Roles diferentes são agregadas pelo mesmo par **direcionado**, categoria,
+Run ID e contexto, reunindo os patches individuais disponíveis. A média é `SUM(Games * Winrate) / SUM(Games)`. Exemplo sintético:
+10 jogos a 49% e 3 jogos a 55% produzem 13 Games agregados e 50,3846%. O mesmo cálculo se aplica às contribuições de patches diferentes, sem média simples entre percentuais.
 A tabela de origem permanece intacta; não se calcula uma contagem de vitórias exatas.
 
 Dados nulos/sem Games não produzem observações utilizáveis; winrate zero com Games
 positivo é válido. Repetições do mesmo par/role/contexto são rejeitadas em vez de
 somadas automaticamente. Categorias e direções opostas não são misturadas.
-O carregamento recusa contextos diferentes dentro de uma mesma categoria/patch.
+O carregamento recusa contextos diferentes dentro da mesma categoria, inclusive entre patches. Uma linha do mesmo par/role em patches diferentes é válida; repetição dentro do mesmo patch continua sendo rejeitada.
 O contexto provém dos metadados preservados: isso não verifica retroativamente
 filtros que eram desconhecidos na coleta. Não há fusão com a planilha antiga.
 
@@ -47,8 +47,10 @@ nem pressupõe que todos os cruzamentos terão dados nessas duas categorias.
 Cada componente usa a média ponderada por Games das relações encontradas.
 
 Na sinergia, consultam-se os 10 pares não ordenados de aliados. Se há A→B e B→A,
-escolhe-se a direção utilizável com mais Games; empate usa ordem canônica das
-chaves. As direções não são somadas e a ordem de entrada não altera o resultado.
+escolhe-se, em cada patch, a direção utilizável com mais Games; empate usa ordem
+canônica das chaves. Depois, as contribuições dos patches são agregadas. As direções
+opostas do mesmo patch não são somadas e a ordem de entrada não altera o resultado.
+Isso permite usar um patch com A→B disponível e outro com apenas B→A disponível.
 
 Pesos iniciais configuráveis: 40% direta, 30% indireta e 30% sinergia. O score de
 cada lado é a soma ponderada dos componentes. O indicador relativo é
@@ -72,8 +74,14 @@ os nomes originais no banco. Não inventa equivalências entre nomes completamen
 diferentes. O seletor usa o catálogo da execução para evitar nomes desconhecidos.
 
 GD@15, CSD@15, XPD@15 e KDA não entram no cálculo. Não há ponderação por recência;
-a primeira versão usa somente o patch escolhido. A combinação de últimos cinco
-patches e sua validação ficam para uma próxima etapa.
+todos os patches individuais da execução entram com peso proporcional aos Games
+das relações. Um peso adicional para os últimos cinco patches fica para depois.
+O resultado inclui patches_used e patch_sources em cada relação, com Games,
+winrate e direção utilizada por patch. A interface não exige escolher patch.
+O argumento CLI --patch continua apenas como opção explícita de auditoria; se
+omitido, o cálculo usa o histórico completo. Registros de patch desconhecido ou
+ALL agregado não são somados com patches individuais. O SQL original permanece
+separado por patch; a união só existe na camada de análise em memória.
 
 ## Verificação
 
