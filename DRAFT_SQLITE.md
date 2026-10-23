@@ -1,12 +1,12 @@
 # Comparador de drafts SQLite — versão paralela
 
-Arquivos novos: `modelo_draft_sqlite.py` (consulta/cálculo) e `app_draft_sqlite.py`
-(interface). O modelo/app antigos, merge, scraper, planilhas e banco não são
+Arquivos: `modelo_draft_sqlite.py` (consulta/cálculo), `app_draft_sqlite.py`
+(interface) e `draft_workspace.py` (histórico e retratos em cache). O modelo/app antigos, merge, scraper, planilhas e banco não são
 alterados. O SQLite é aberto em `mode=ro`. Não é necessária nova importação.
 
 ## Executar no computador do usuário
 
-Baixe os dois arquivos e coloque-os junto do banco em `D:\Importacao_s16`.
+Baixe os três arquivos e coloque-os junto do banco em `D:\Importacao_s16`.
 No PowerShell:
 
 ```powershell
@@ -124,9 +124,9 @@ Sem indicador final, não são inventados líder ou contribuições comparáveis
 
 Cada clique em Analisar e registrar cria uma entrada com nome, drafts, Run ID,
 patches, pesos, horário UTC, resultado e explicação. As anotações pessoais são
-salvas no registro somente ao clicar Registrar anotações. O histórico fica na
-sessão Streamlit, não é escrito no SQLite e não é restaurado automaticamente.
-Baixe o JSON, relatório Markdown ou histórico JSON antes de fechar/reiniciar o app.
+salvas no registro somente ao clicar Registrar anotações. O histórico é salvo automaticamente em um SQLite pessoal separado da coleta e
+restaurado ao reabrir o app. Nome, tags e observações são atualizados ao clicar
+Registrar anotações. Os downloads JSON/Markdown são cópias adicionais opcionais.
 O registro exportado inclui os dados utilizados no cálculo e a origem por patch.
 A interface identifica quando as configurações exibidas diferem do registro aberto.
 
@@ -151,3 +151,52 @@ com a mesma permutação preserva os confrontos. Sinergia continua independente 
 ordem. Análises de versões anteriores podem mudar numericamente e devem ser
 refeitas com as posições preenchidas corretamente. Nenhuma mudança no SQLite,
 pesos 40/30/30 ou agregação do histórico é necessária.
+
+
+## Mesa de draft e histórico permanente
+
+Atualize app_draft_sqlite.py e mantenha modelo_draft_sqlite.py e draft_workspace.py
+na mesma pasta. O comando Streamlit é o mesmo. A mesa alinha os cinco confrontos
+TOP/JUNGLE/MID/ADC/SUPPORT, exibe retratos de 48px dos campeões selecionados e
+permite trocar os lados ou carregar um draft do histórico para revisão. Seletores
+continuam pesquisáveis. Repetições são sinalizadas e impedem registrar um draft
+inválido. Não há download antecipado de todos os retratos do catálogo.
+
+O painel central mostra indicadores, diferença e principal contribuição aritmética
+a favor do líder. Cards por componente exibem os dois scores, pesos e cobertura;
+os detalhes e a origem por patch continuam disponíveis. As explicações, os pesos
+40/30/30 e o cálculo são os mesmos desta versão anterior.
+
+O histórico pessoal padrão fica em `.mega_lol_workspace/analises.sqlite`, ao lado
+do script. Não é a base `mega_lol_s16.sqlite`. A aplicação recusa usar a própria
+base de coleta ou um SQLite alheio como arquivo de histórico. Resultados salvos
+são imutáveis; revisar um draft gera outra análise, enquanto nome, notas e tags
+podem ser atualizados. O histórico permite busca por nome/campeão, filtro por tag,
+prévia dos drafts e comparação de dois registros. Comparações com configurações
+diferentes recebem aviso. Fechar o navegador não apaga as análises já salvas.
+Faça backup desse arquivo pessoal se quiser preservar suas anotações ao mudar
+ou reinstalar a aplicação; ele também pode ser escolhido na barra lateral.
+
+Os retratos usam os endpoints HTTPS oficiais do Data Dragon (Riot), com mapeamento
+por nome e ID oficiais (por exemplo, Wukong → MonkeyKing). São apenas recursos
+visuais; a versão das imagens não filtra a base do modelo. O cache em disco fica em
+`.mega_lol_workspace/portraits`. O manifesto é atualizado após sete dias; falhas
+são amortecidas por cinco minutos para evitar repetir pedidos em cada interação.
+Somente imagens de campeões usados são buscadas. Sem rede, bloqueio do CDN, nome
+não reconhecido ou resposta inválida, aparecem iniciais e nomes, e o cálculo segue.
+O acesso inicial ao CDN da Riot foi bloqueado com HTTP 403 pelo proxy deste ambiente;
+a integração de rede real ainda precisa ser conferida no computador do usuário.
+Testes automatizados usam respostas sintéticas e não dependem desse serviço.
+
+Novas verificações:
+
+```sh
+python -m unittest discover -s tests -p test_draft_workspace.py -v
+python -m unittest discover -s tests -p test_workspace_ui.py -v
+```
+
+Incluem persistência/reabertura, notas/tags, imutabilidade de resultados, proteção
+da base de origem, cache e falha de imagens, seleção/troca de lados, bloqueio de
+campeão repetido, filtros do histórico e comparação. A interface também foi
+exercitada contra a cópia real importada; o draft Ambessa/Skarner/Ryze/Lucian/Milio
+contra Gnar/Wukong/Annie/Kalista/Renata Glasc manteve 47,93% / 52,07%.

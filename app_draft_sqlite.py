@@ -1,22 +1,39 @@
-"""Draft workspace. Source SQLite is read-only; notes stay in the browser session."""
+"""Draft workspace. Source SQLite is read-only; history and portraits use a separate local workspace."""
 import json
+import html
+from collections import Counter
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timezone
 import uuid
 
 import streamlit as st
-from modelo_draft_sqlite import WEIGHTS, POSITIONS, MODEL_VERSION, catalog, compare_drafts, explain_comparison
+from modelo_draft_sqlite import WEIGHTS, POSITIONS, MODEL_VERSION, name_key, catalog, compare_drafts, explain_comparison
+from draft_workspace import AnalysisHistory, PortraitCache
 
 LABELS = {'Direct_Matchup':'Confronto direto','Indirect_Matchup':'Confronto indireto','Ally_Synergy':'Sinergia'}
 SIDES = {'blue':'Azul','red':'Vermelho','tie':'Equilíbrio'}
 st.set_page_config(page_title='MEGA • Estúdio de drafts', layout='wide', initial_sidebar_state='expanded')
 st.markdown('''<style>
-.block-container {max-width:1250px; padding-top:2rem; padding-bottom:3rem;}
+.block-container {max-width:1320px; padding-top:2rem; padding-bottom:3rem;}
 [data-testid="stMetric"] {border:1px solid #8494aa40; border-radius:14px; padding:1rem;}
 [data-testid="stMetricValue"] {font-weight:750;}
 [data-testid="stSidebar"] {border-right:1px solid #8494aa30;}
 .stButton>button {border-radius:10px; font-weight:650;}
+.mega-hero {background:linear-gradient(120deg,#0d1729,#1c3049);padding:28px 32px;border-radius:18px;color:#f4f7fc;margin-bottom:24px;}
+.mega-hero h1 {color:#f4f7fc !important;font-size:2rem;margin:4px 0 8px;}
+.mega-hero small {color:#d8b875;letter-spacing:.15em;font-weight:700;}
+.mega-hero p {color:#becce0;margin:0;}
+.portrait-fallback {width:48px;height:48px;border-radius:10px;background:#17283e;color:#c7d4e8;display:flex;align-items:center;justify-content:center;font-weight:700;margin-top:25px;}
+.lane {text-align:center;color:#9c8b67;font-size:.75rem;letter-spacing:.08em;padding-top:40px;}
+.component-card {border:1px solid #8294ad40;border-radius:14px;padding:18px;margin-bottom:12px;}
+.component-card h4 {margin:0 0 12px;font-size:1rem;}
+.component-line {display:flex;justify-content:space-between;margin:8px 0 4px;font-size:.85rem;}
+.component-track {height:7px;background:#8294ad25;border-radius:7px;overflow:hidden;}
+.component-blue {height:100%;background:#3b82f6;border-radius:7px;}
+.component-red {height:100%;background:#ef4444;border-radius:7px;}
+.compare-bar {display:flex;height:12px;border-radius:12px;overflow:hidden;margin:8px 0 18px;}
+.compare-bar .blue {background:#3b82f6;}.compare-bar .red {background:#ef4444;}
 </style>''',unsafe_allow_html=True)
 
 
@@ -73,9 +90,42 @@ def markdown_record(entry):
     return '\n\n'.join(lines)
 
 
-st.caption('MEGA LoL / ANÁLISE DE DRAFT')
-st.title('Entenda o placar. Registre sua leitura.')
-st.write('Compare dez campeões com o histórico completo e acompanhe o que mais pesou no cálculo.')
+WORKSPACE = Path(__file__).resolve().parent / '.mega_lol_workspace'
+portraits = PortraitCache(WORKSPACE / 'portraits')
+
+
+def portrait(champion):
+    image = portraits.image(champion)
+    if image:
+        st.image(image,width=48)
+    else:
+        initials = html.escape((champion or '—')[:2].upper())
+        st.markdown(f'<div class="portrait-fallback">{initials}</div>',unsafe_allow_html=True)
+
+
+def draft_strip(champions):
+    for column, champion in zip(st.columns(5),champions):
+        with column:
+            portrait(champion)
+            st.caption(champion)
+
+
+def swap_sides():
+    blue_values = [st.session_state.get('blue_'+position) for position in POSITIONS]
+    red_values = [st.session_state.get('red_'+position) for position in POSITIONS]
+    for position,a,b in zip(POSITIONS,blue_values,red_values):
+        st.session_state['blue_'+position] = b
+        st.session_state['red_'+position] = a
+
+
+def load_draft(entry):
+    for side in ('blue','red'):
+        for position,champion in zip(POSITIONS,entry['result']['drafts'][side]):
+            st.session_state[side+'_'+position] = champion if champion in options['champions'] else None
+    st.session_state['draft_name'] = entry['name']+' — revisão'
+
+
+st.markdown('<div class="mega-hero"><small>MEGA / DRAFT LAB</small><h1>Da composição à leitura do jogo.</h1><p>Monte os dois lados, entenda as contribuições e guarde suas análises.</p></div>',unsafe_allow_html=True)
 with st.sidebar:
     st.header('Base e cálculo')
     database = st.text_input('Arquivo SQLite', value='mega_lol_s16.sqlite')
@@ -88,7 +138,22 @@ with st.sidebar:
     except (OSError,ValueError,sqlite3.Error) as exc:
         st.info(f'Abra seu banco para começar: {exc}')
         st.stop()
+    history_path = st.text_input('Arquivo do histórico pessoal',value=str(WORKSPACE / 'analises.sqlite'))
+    try:
+        history = AnalysisHistory(history_path,path)
+        if 'history_initialized' not in st.session_state:
+            stored_ids = {e['id'] for e in history.entries()}
+            for old in st.session_state.get('analyses',[]):
+                if old['id'] not in stored_ids:
+                    old.setdefault('tags',[])
+                    history.save(old)
+            st.session_state['history_initialized'] = True
+        st.session_state['analyses'] = history.entries()
+    except (OSError,ValueError,sqlite3.Error) as exc:
+        st.error(f'Não foi possível abrir o histórico: {exc}')
+        st.stop()
     st.caption(f"{len(options['champions'])} campeões · {len(options['patches'])} patches agregados")
+    st.caption('Análises e anotações salvas automaticamente em um banco separado da coleta.')
     with st.expander('Pesos e critérios'):
         direct = st.number_input('Confronto direto (%)',0,100,40)
         indirect = st.number_input('Confronto indireto (%)',0,100,30)
@@ -101,18 +166,35 @@ with st.sidebar:
         st.write('Patches:',', '.join(options['patches']))
         st.caption('SQLite somente leitura. Gold/GD@15 e peso adicional por recência não são usados.')
 weights = tuple(zip(WEIGHTS,(direct/100,indirect/100,synergy/100)))
-st.session_state.setdefault('analyses',[])
-with st.form('draft_form'):
-    name = st.text_input('Nome da análise (opcional)',placeholder='Ex.: teste de composição / jogo 1')
-    left,right = st.columns(2)
-    with left:
-        st.subheader('🔵 Time azul')
-        blue = [st.selectbox('Azul — '+position,options['champions'],index=None,placeholder='Escolha o campeão',key='blue_'+position) for position in POSITIONS]
-    with right:
-        st.subheader('🔴 Time vermelho')
-        red = [st.selectbox('Vermelho — '+position,options['champions'],index=None,placeholder='Escolha o campeão',key='red_'+position) for position in POSITIONS]
-    st.caption('Direta: TOP × TOP, JUNGLE × JUNGLE, MID × MID, ADC × ADC e SUPPORT × SUPPORT. Indireta: os outros 20 cruzamentos. Sinergia: os dez pares de aliados.')
-    submitted = st.form_submit_button('Analisar e registrar',type='primary',width='stretch')
+name = st.text_input('Nome da análise (opcional)',placeholder='Ex.: pré-jogo / composição de teste',key='draft_name')
+head_blue,head_swap,head_red = st.columns([5,2,5])
+head_blue.subheader('🔵 Time azul')
+head_swap.button('⇄ Trocar lados',on_click=swap_sides,width='stretch')
+head_red.subheader('🔴 Time vermelho')
+blue,red = [],[]
+for position in POSITIONS:
+    a,lane,b = st.columns([5,1,5])
+    with a:
+        image,selector = st.columns([1,6])
+        current = st.session_state.get('blue_'+position)
+        with image: portrait(current)
+        with selector:
+            blue.append(st.selectbox('Azul — '+position,options['champions'],index=None,placeholder='Buscar campeão',key='blue_'+position))
+    with lane:
+        st.markdown('<div class="lane">'+position+'</div>',unsafe_allow_html=True)
+    with b:
+        image,selector = st.columns([1,6])
+        current = st.session_state.get('red_'+position)
+        with image: portrait(current)
+        with selector:
+            red.append(st.selectbox('Vermelho — '+position,options['champions'],index=None,placeholder='Buscar campeão',key='red_'+position))
+chosen = [c for c in [*blue,*red] if c]
+counts = Counter(name_key(c) for c in chosen)
+duplicates = sorted({c for c in chosen if counts[name_key(c)]>1})
+if duplicates:
+    st.warning('Campeão repetido: '+', '.join(duplicates)+'. Cada campeão só pode ocupar uma posição no draft.')
+st.caption(f'{len(chosen)}/10 posições preenchidas · 5 confrontos diretos · 20 cruzamentos indiretos por lado · 10 pares de aliados')
+submitted = st.button('Analisar e registrar',type='primary',width='stretch',disabled=len(chosen)!=10 or bool(duplicates))
 if submitted:
     try:
         if any(c is None for c in [*blue,*red]):
@@ -121,18 +203,32 @@ if submitted:
             result = calculate(str(path),tuple(blue),tuple(red),options['run_id'],weights,int(minimum),fingerprint,MODEL_VERSION)
         entry = {'id':uuid.uuid4().hex,'name':name.strip() or f"Análise {len(st.session_state.analyses)+1}",
                  'created_at_utc':datetime.now(timezone.utc).isoformat(), 'result':result,
-                 'explanation':explain_comparison(result,float(large_gap)), 'notes':'',
+                 'explanation':explain_comparison(result,float(large_gap)), 'notes':'', 'tags':[],
                  'settings':{'database':str(path),'fingerprint':fingerprint,'minimum_games':int(minimum)}}
-        st.session_state.analyses.append(entry)
+        history.save(entry)
+        st.session_state.analyses.insert(0,entry)
         st.session_state['selected_analysis'] = entry['id']
+        st.session_state['history_search'] = ''
+        st.session_state['history_tag'] = 'Todas'
     except (ValueError,sqlite3.Error) as exc:
         st.error(str(exc))
 if not st.session_state.analyses:
     st.info('Selecione cinco campeões por lado e clique em Analisar e registrar. O banco original não será alterado.')
     st.stop()
 st.divider()
-entries = {e['id']:e for e in st.session_state.analyses}
-selected = st.selectbox('Registro desta sessão',list(entries),format_func=lambda key:entries[key]['name'],key='selected_analysis')
+with st.expander(f"Histórico salvo — {len(st.session_state.analyses)} análises"):
+    search = st.text_input('Buscar por nome ou campeão',key='history_search')
+    filter_tag = st.selectbox('Filtrar tag',['Todas']+sorted({tag for e in st.session_state.analyses for tag in e.get('tags',[])}),key='history_tag')
+filtered = [e for e in st.session_state.analyses if
+            (not search or search.casefold() in (e['name']+' '+str(e['result']['drafts'])).casefold()) and
+            (filter_tag=='Todas' or filter_tag in e.get('tags',[]))]
+if not filtered:
+    st.info('Nenhum registro corresponde aos filtros do histórico. Limpe a busca para ver as análises.')
+    st.stop()
+entries = {e['id']:e for e in filtered}
+if st.session_state.get('selected_analysis') not in entries:
+    st.session_state['selected_analysis'] = next(iter(entries))
+selected = st.selectbox('Análise salva',list(entries),format_func=lambda key:entries[key]['name']+' · '+entries[key]['created_at_utc'][:16].replace('T',' ')+' UTC',key='selected_analysis')
 entry = entries[selected]
 result, explanation = entry['result'],entry['explanation']
 if (result.get('model_version') != MODEL_VERSION or list(blue) != result['drafts']['blue'] or list(red) != result['drafts']['red'] or
@@ -143,8 +239,14 @@ if (result.get('model_version') != MODEL_VERSION or list(blue) != result['drafts
     st.warning('Exibindo um registro anterior. As entradas atuais diferem desta análise; clique em Analisar e registrar para gerar outra.')
 st.subheader(entry['name'])
 st.caption(f"Registrado em {entry['created_at_utc']} · {len(result['patches_used'])} patches de origem")
-st.write('**Azul:** '+', '.join(result['drafts']['blue']))
-st.write('**Vermelho:** '+', '.join(result['drafts']['red']))
+preview_blue,preview_red = st.columns(2)
+with preview_blue:
+    st.caption('TIME AZUL REGISTRADO')
+    draft_strip(result['drafts']['blue'])
+with preview_red:
+    st.caption('TIME VERMELHO REGISTRADO')
+    draft_strip(result['drafts']['red'])
+st.button('Carregar este draft para revisar',on_click=load_draft,args=(entry,))
 if result.get('direct_alignment'):
     with st.expander('Conferir os cinco confrontos diretos',expanded=True):
         st.dataframe([{'Posição':row['position'],'Azul':row['blue'],'Vermelho':row['red']} for row in result['direct_alignment']],width='stretch',hide_index=True)
@@ -155,12 +257,32 @@ else:
     left.metric('Indicador azul',f"{result['relative_indicator']['blue']:.2f}%")
     middle.metric('Diferença',f"{abs(explanation['indicator_gap']):.2f} p.p.")
     right.metric('Indicador vermelho',f"{result['relative_indicator']['red']:.2f}%")
+    st.markdown(f"<div class='compare-bar'><div class='blue' style='width:{result['relative_indicator']['blue']}%'></div><div class='red' style='width:{result['relative_indicator']['red']}%'></div></div>",unsafe_allow_html=True)
     if explanation['leader'] == 'tie':
         st.info('Os indicadores ficaram iguais.')
     else:
         label = 'Disparidade destacada' if explanation['large_gap'] else 'Leitura do cálculo'
         st.write(f"**{label}: lado {SIDES[explanation['leader']].lower()} à frente.**")
-read_tab,evidence_tab,notes_tab = st.tabs(['Por que deu esse resultado?','Relações e cobertura','Anotações e exportação'])
+        direction = 1 if explanation['leader']=='blue' else -1
+        favorable = [c for c in explanation['components'] if c['indicator_gap_contribution'] is not None and direction*c['indicator_gap_contribution']>0]
+        if favorable:
+            main = max(favorable,key=lambda c:abs(c['indicator_gap_contribution']))
+            st.write(f"Principal contribuição a favor do líder: **{LABELS[main['category']]}**, com {abs(main['indicator_gap_contribution']):.2f} p.p. da diferença.")
+for column,category in zip(st.columns(3),WEIGHTS):
+    with column:
+        blue_component = result['teams']['blue']['components'][category]
+        red_component = result['teams']['red']['components'][category]
+        blue_value,red_value = blue_component['score'],red_component['score']
+        blue_text = 'Sem dados' if blue_value is None else f'{blue_value:.1f}'
+        red_text = 'Sem dados' if red_value is None else f'{red_value:.1f}'
+        st.markdown(f"""<div class="component-card"><h4>{LABELS[category]} · {result['weights'][category]:.0%}</h4>
+          <div class="component-line"><span>Azul</span><b>{blue_text}</b></div>
+          <div class="component-track"><div class="component-blue" style="width:{blue_value or 0}%"></div></div>
+          <div class="component-line"><span>Vermelho</span><b>{red_text}</b></div>
+          <div class="component-track"><div class="component-red" style="width:{red_value or 0}%"></div></div></div>""",unsafe_allow_html=True)
+        st.caption(f"Pares com dados: azul {blue_component['found_pairs']}/{blue_component['queried_pairs']} · vermelho {red_component['found_pairs']}/{red_component['queried_pairs']}")
+st.caption('Indicadores comparativos, não probabilidades calibradas. As amostras de relações podem compartilhar partidas.')
+read_tab,evidence_tab,notes_tab,compare_tab = st.tabs(['Entender o resultado','Relações e cobertura','Anotações e exportação','Comparar análises'])
 with read_tab:
     st.caption('Decomposição matemática do indicador. Não demonstra causas reais de vitória.')
     component_rows = [{'Componente':LABELS[c['category']], 'Peso':f"{c['weight']:.0%}",
@@ -190,7 +312,7 @@ with read_tab:
             if not explanation[key]:
                 st.caption('Não há contribuição comparável para destacar.')
     if explanation['alerts']:
-        with st.expander(f"Limitações desta leitura ({len(explanation['alerts'])})",expanded=True):
+        with st.expander(f"Limitações desta leitura ({len(explanation['alerts'])})",expanded=False):
             for alert in explanation['alerts']:
                 st.write('• '+alert_text(alert))
 with evidence_tab:
@@ -205,17 +327,50 @@ with evidence_tab:
     st.dataframe(coverage,width='stretch',hide_index=True)
     st.caption('Games somados entre relações não representam partidas independentes. Pares consultados não são necessariamente pares que deveriam existir na categoria.')
 with notes_tab:
+    renamed = st.text_input('Nome do registro',value=entry['name'],key='rename_'+entry['id'])
+    tags = st.multiselect('Tags',['Pré-jogo','Teste','Revisar','Concluído'],default=entry.get('tags',[]),key='tags_'+entry['id'])
     note = st.text_area('Sua leitura / observações',value=entry['notes'],key='note_'+entry['id'],
                         placeholder='Ex.: quero revisar a amostra do confronto direto antes de confiar no placar.')
     if st.button('Registrar anotações'):
         entry['notes'] = note
-        st.success('Anotações atualizadas no registro desta sessão.')
-    st.info('Os registros ficam nesta sessão do app. Baixe os arquivos para guardá-los antes de fechar ou reiniciar. Alterações no texto só entram na exportação após Registrar anotações.')
+        entry['tags'] = tags
+        entry['name'] = renamed.strip() or entry['name']
+        history.save(entry)
+        st.rerun()
+    st.info('Histórico permanente salvo no arquivo pessoal, separado da coleta. Clique em Registrar anotações para salvar nome, tags e observações. Os downloads servem como cópias adicionais.')
+    st.caption('Arquivo do histórico: '+str(history.path))
     c1,c2 = st.columns(2)
     c1.download_button('Baixar análise JSON',json.dumps(entry,ensure_ascii=False,indent=2),
                        file_name=f"draft_{entry['id'][:8]}.json",mime='application/json')
     c2.download_button('Baixar relatório legível',markdown_record(entry),
                        file_name=f"draft_{entry['id'][:8]}.md",mime='text/markdown')
-    st.download_button('Baixar todos os registros da sessão',json.dumps(st.session_state.analyses,ensure_ascii=False,indent=2),
+    st.download_button('Baixar histórico completo',json.dumps(st.session_state.analyses,ensure_ascii=False,indent=2),
                        file_name='historico_drafts.json',mime='application/json')
+with compare_tab:
+    all_entries = {e['id']:e for e in st.session_state.analyses}
+    if len(all_entries)<2:
+        st.info('Registre outra análise para comparar os drafts lado a lado.')
+    else:
+        first_column,second_column = st.columns(2)
+        first_id = first_column.selectbox('Análise A',list(all_entries),format_func=lambda k:all_entries[k]['name'],key='compare_a')
+        second_options = [k for k in all_entries if k != first_id]
+        second_id = second_column.selectbox('Análise B',second_options,format_func=lambda k:all_entries[k]['name'],key='compare_b')
+        selected_entries = [all_entries[first_id],all_entries[second_id]]
+        comparison=[]
+        for column,snapshot in zip((first_column,second_column),selected_entries):
+            with column:
+                st.write(snapshot['name'])
+                st.caption('Azul: '+', '.join(snapshot['result']['drafts']['blue']))
+                draft_strip(snapshot['result']['drafts']['blue'])
+                st.caption('Vermelho: '+', '.join(snapshot['result']['drafts']['red']))
+                draft_strip(snapshot['result']['drafts']['red'])
+            relative = snapshot['result']['relative_indicator']
+            comparison.append({'Análise':snapshot['name'],'Azul':relative['blue'] if relative else None,
+                'Vermelho':relative['red'] if relative else None,'Diferença azul − vermelho':snapshot['explanation']['indicator_gap'],
+                'Patches':len(snapshot['result']['patches_used']),'Tags':', '.join(snapshot.get('tags',[]))})
+        st.dataframe(comparison,width='stretch',hide_index=True)
+        a,b = (snapshot['result'] for snapshot in selected_entries)
+        if any(a.get(k)!=b.get(k) for k in ('model_version','run_id','weights','patches_used')) or json.dumps(selected_entries[0]['settings'],sort_keys=True)!=json.dumps(selected_entries[1]['settings'],sort_keys=True):
+            st.warning('Esses registros usam configurações, versão ou base diferentes. A comparação não isola o efeito da troca de campeões.')
+        st.caption('Comparação descritiva de análises salvas; não comprova qual modelo prevê melhor.')
 st.caption(result['note'])
