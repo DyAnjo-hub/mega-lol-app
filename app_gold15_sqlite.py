@@ -31,9 +31,7 @@ with st.sidebar:
     st.header('Base de dados')
     database = st.text_input('Arquivo SQLite', str(Path(__file__).with_name('mega_lol_s16.sqlite')))
     minimum = st.number_input('Mínimo de jogos por confronto', min_value=1, value=1, step=1)
-    synergy_percent = st.slider('Peso da sinergia ADC/suporte (%)', min_value=0, max_value=100, value=40, step=5)
-    synergy_weight = synergy_percent/100
-    st.caption(f'Bot: {100-synergy_percent}% confronto direto + {synergy_percent}% parceria. TOP/JUNGLE/MID: 100% direto. Pesos experimentais; 0% recupera o cálculo anterior.')
+    synergy_weight = .4
     st.caption('Todos os patches individuais reunidos. Banco aberto somente para leitura.')
 try:
     path = Path(database).expanduser().resolve()
@@ -84,8 +82,6 @@ if result:
     a.metric('Diferença estimada aos 15', gold(result['total_gd15']))
     b.metric('Confrontos com dados suficientes', f"{result['covered_positions']}/5")
     c.metric('Referência: somente direto', gold(result['direct_total_gd15']))
-    weights = result['bot_weights']
-    st.caption(f"Resultado calculado com {weights['direct']:.0%} direto / {weights['synergy']:.0%} parceria no bot. Sem redução automática em direção a zero.")
     if result['total_gd15'] is None:
         st.warning('Sem total completo. Subtotal dos confrontos disponíveis: '+gold(result['partial_gd15']))
     rows = [{'Posição':lane['position'],'Azul':lane['blue'],'Vermelho':lane['red'],
@@ -97,20 +93,5 @@ if result:
              'Situação':{'available':'Disponível','missing':'Sem dados','insufficient_games':'Abaixo do mínimo'}[lane['status']]}
             for lane in result['lanes']]
     st.dataframe(rows, hide_index=True, width='stretch')
-    counts = [lane['games'] for lane in result['lanes']]
-    counts += [lane['synergy'][side]['games'] for lane in result['lanes'] if 'synergy' in lane for side in ('blue','red')]
-    if any(n is not None and n < 10 for n in counts):
-        st.warning('Há confrontos com menos de 10 jogos. A média pode variar muito; esse aviso não representa um nível estatístico de confiança.')
-    st.caption('Cada posição contribui uma vez. Os jogos ponderam os registros dentro do confronto, não o peso da posição no total.')
-    if weights['synergy']:
-        st.caption('Parceria por posição = (GD do campeão azul com seu aliado − GD do campeão vermelho com seu aliado) / 2. As duas perspectivas são centralizadas para manter a escala da diferença individual. Não são partidas adicionais.')
-        st.caption('Faltando uma relação exigida pelo peso, a posição fica indisponível; os pesos não são redistribuídos automaticamente.')
-    with st.expander('Fontes, patches e direções utilizadas'):
-        st.write('Por patch, usa-se uma direção com mais jogos válidos; empate por nome normalizado. A direção inversa tem sinal invertido. Não somamos as duas direções.')
-        st.json(result)
-    with st.expander('Como interpretar e limitações', expanded=True):
-        for note in result['limitations']:
-            st.write('• '+note)
-        st.caption(result['interpretation'])
     st.download_button('Baixar análise JSON', json.dumps(result,ensure_ascii=False,indent=2,allow_nan=False),
                        file_name='analise_gold15.json',mime='application/json')

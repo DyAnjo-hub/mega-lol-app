@@ -1,12 +1,12 @@
 # Comparador de drafts SQLite — versão paralela
 
-Arquivos: `modelo_draft_sqlite.py` (consulta/cálculo), `app_draft_sqlite.py`
-(interface) e `draft_workspace.py` (histórico e retratos em cache). O modelo/app antigos, merge, scraper, planilhas e banco não são
+Arquivos: `modelo_draft_sqlite.py` (winrate), `modelo_gold15_sqlite.py` (ouro),
+`app_draft_sqlite.py` (interface) e `draft_workspace.py` (histórico e retratos em cache). O modelo/app antigos, merge, scraper, planilhas e banco não são
 alterados. O SQLite é aberto em `mode=ro`. Não é necessária nova importação.
 
 ## Executar no computador do usuário
 
-Baixe os três arquivos e coloque-os junto do banco em `D:\Importacao_s16`.
+Baixe os quatro arquivos e coloque-os junto do banco em `D:\Importacao_s16`.
 No PowerShell:
 
 ```powershell
@@ -76,7 +76,7 @@ A normalização de nomes resolve espaços, apóstrofos e pontuação comuns, pr
 os nomes originais no banco. Não inventa equivalências entre nomes completamente
 diferentes. O seletor usa o catálogo da execução para evitar nomes desconhecidos.
 
-GD@15, CSD@15, XPD@15 e KDA não entram no cálculo. Não há ponderação por recência;
+GD@15, CSD@15, XPD@15 e KDA não entram no cálculo de winrate. Não há ponderação por recência;
 todos os patches individuais da execução entram com peso proporcional aos Games
 das relações. Um peso adicional para os últimos cinco patches fica para depois.
 O resultado inclui patches_used e patch_sources em cada relação, com Games,
@@ -85,6 +85,47 @@ O argumento CLI --patch continua apenas como opção explícita de auditoria; se
 omitido, o cálculo usa o histórico completo. Registros de patch desconhecido ou
 ALL agregado não são somados com patches individuais. O SQL original permanece
 separado por patch; a união só existe na camada de análise em memória.
+
+## Ouro integrado, com modelo independente
+
+O mesmo botão **Analisar e registrar** executa os dois modelos para os dez
+campeões selecionados, na mesma ordem e execução da base. As funções, caches,
+parâmetros e resultados permanecem separados. O resultado de ouro não altera
+o indicador de winrate e o winrate não entra no cálculo de ouro. Os pesos e
+o mínimo de Games configuráveis do winrate não são enviados ao modelo de ouro.
+
+O painel **MEGA / GOLD 15** mantém três métricas (diferença, cobertura e
+referência somente direta) e a tabela por posição com direto, parceria,
+contribuição final e jogos. Sem controle manual de sinergia ou explicações
+extensas. A sinergia do bot fica fixa em 40% (direto 60%); TOP/JUNGLE/MID seguem
+100% diretos e o mínimo de ouro é 1 jogo por relação. As fórmulas existentes
+dos dois modelos não foram alteradas nesta integração.
+
+Um erro no cálculo de ouro não impede salvar/exibir o winrate. Um erro de
+parâmetros do winrate não impede calcular/exibir o ouro da tentativa atual;
+nesse caso não é criado um registro de winrate incompleto. Se faltarem dados
+de ouro, o painel mantém o sinal de indisponibilidade e o subtotal identificado.
+
+Novas análises guardam `gold_result`/`gold_error` ao lado de `result` no histórico
+pessoal e nos downloads JSON. O relatório Markdown inclui o resumo de ouro e
+a comparação de análises inclui a diferença de GD@15. A versão, os pesos,
+as limitações e fontes completas continuam preservados no JSON, mesmo sem
+explicações na tela.
+
+Registros antigos sem ouro continuam intactos e mostram uma indicação para
+carregar o draft e registrar uma nova análise. Não há preenchimento retroativo
+com a base atual. Ao selecionar um registro salvo, ambos os painéis usam os
+drafts daquele registro; mudar os seletores exige analisar novamente.
+
+Para atualizar uma instalação com os dois apps já presentes, substitua apenas
+`app_draft_sqlite.py` pela versão atual e mantenha `modelo_gold15_sqlite.py`
+na mesma pasta. O app separado `app_gold15_sqlite.py` é opcional; ele também
+passou a usar peso fixo e visualização concisa. Execute somente o comando
+`streamlit run .\app_draft_sqlite.py` para abrir os dois indicadores juntos.
+
+Os testes offline cobrem seleção compartilhada, equivalência com os modelos
+executados separadamente, independência dos parâmetros, falhas isoladas,
+histórico antigo/novo, troca de lados e SQLite original inalterado.
 
 ## Verificação
 

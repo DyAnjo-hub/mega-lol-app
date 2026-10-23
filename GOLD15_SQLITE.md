@@ -25,10 +25,17 @@ JUNGLE, MID, ADC, SUPPORT. Clique em **Calcular GD@15**. A seleção de Run ID
 permite usar bancos com várias coletas sem misturar snapshots.
 
 Atualização: baixe novamente `app_gold15_sqlite.py` e `modelo_gold15_sqlite.py`.
-O `modelo_draft_sqlite.py` permanece igual. O controle **Peso da sinergia
-ADC/suporte (%)** começa em 40%; coloque 0% para recuperar o cálculo anterior.
+O `modelo_draft_sqlite.py` permanece igual. A interface usa sinergia fixa em
+40%, sem controle manual. A opção CLI `--synergy-weight 0` continua disponível
+para conferir o cálculo anterior sem mudar as fórmulas.
 O mínimo de jogos vale para cada relação exigida, inclusive as relações de
-parceria em cada time. Alterar os pesos exige recalcular e aparece no JSON.
+parceria em cada time. Os pesos usados aparecem no JSON.
+
+O mesmo resultado também está integrado ao `app_draft_sqlite.py`, com uma única
+seleção de campeões para winrate e ouro. Não é necessário executar os dois apps.
+Na interface unificada, ambos os modelos permanecem independentes; detalhes em
+`DRAFT_SQLITE.md`. A visualização de ouro mantém as métricas e tabela, sem as
+explicações extensas. Metadados e fontes permanecem nos downloads JSON.
 
 ## Cálculo
 
@@ -70,7 +77,8 @@ Contribuição final = 0,60 × D + 0,40 × Parceria comparativa
 A divisão por dois centraliza duas perspectivas de diferença individual, para
 não adicionar duas diferenças completas ao misturar com D. É uma hipótese de
 escala do indicador, não uma identidade verificada entre essas amostras.
-Os pesos são configuráveis; não foram calibrados com partidas futuras.
+Os pesos são fixos na interface, configuráveis somente pela CLI/função; não
+foram calibrados com partidas futuras.
 
 Cada média B e R usa `sum(Games × GD) / sum(Games)` dos patches e papéis
 disponíveis. A quantidade de jogos não é usada para redistribuir os pesos

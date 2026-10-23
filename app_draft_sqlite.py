@@ -9,10 +9,12 @@ import uuid
 
 import streamlit as st
 from modelo_draft_sqlite import WEIGHTS, POSITIONS, MODEL_VERSION, name_key, catalog, compare_drafts, explain_comparison
+from modelo_gold15_sqlite import MODEL_VERSION as GOLD_MODEL_VERSION, compare_gold15
 from draft_workspace import AnalysisHistory, PortraitCache
 
 LABELS = {'Direct_Matchup':'Confronto direto','Indirect_Matchup':'Confronto indireto','Ally_Synergy':'Sinergia'}
 SIDES = {'blue':'Azul','red':'Vermelho','tie':'Equilíbrio'}
+GOLD_SYNERGY_WEIGHT = .4
 st.set_page_config(page_title='MEGA • Estúdio de drafts', layout='wide', initial_sidebar_state='expanded')
 st.markdown('''<style>
 .block-container {max-width:1320px; padding-top:2rem; padding-bottom:3rem;}
@@ -46,6 +48,36 @@ def available(database, run, fingerprint):
 def calculate(database, blue, red, run, weights, minimum, fingerprint, model_version):
     return compare_drafts(database,list(blue),list(red),run_id=run,
                           weights=dict(weights),minimum_games=minimum)
+
+
+@st.cache_data(show_spinner=False)
+def calculate_gold(database, blue, red, run, fingerprint, model_version):
+    return compare_gold15(database,list(blue),list(red),run_id=run,
+                          minimum_games=1,synergy_weight=GOLD_SYNERGY_WEIGHT)
+
+
+def render_gold(result, error=None):
+    st.subheader('MEGA / GOLD 15 · azul menos vermelho')
+    if result is None:
+        st.info('Ouro indisponível: '+error if error else 'Este registro ainda não contém a análise de ouro. Carregue o draft e clique em Analisar e registrar.')
+        return
+    def gold(value):
+        return 'Sem dados suficientes' if value is None else f'{value:+,.0f} ouro'
+    st.caption('Azul: '+', '.join(result['drafts']['blue'])+' | Vermelho: '+', '.join(result['drafts']['red']))
+    a,b,c = st.columns(3)
+    a.metric('Diferença estimada aos 15',gold(result['total_gd15']))
+    b.metric('Confrontos com dados suficientes',f"{result['covered_positions']}/5")
+    c.metric('Referência: somente direto',gold(result['direct_total_gd15']))
+    if result['total_gd15'] is None:
+        st.warning('Sem total completo. Subtotal disponível: '+gold(result['partial_gd15']))
+    st.dataframe([{'Posição':lane['position'],'Azul':lane['blue'],'Vermelho':lane['red'],
+        'GD@15 direto':lane['direct_gd15'],
+        'GD@15 parceria (comparativo)':lane.get('synergy',{}).get('gd15'),
+        'GD@15 final (azul − vermelho)':lane['gd15'],'Jogos direto':lane['games'],
+        'Jogos parceria azul':lane.get('synergy',{}).get('blue',{}).get('games'),
+        'Jogos parceria vermelho':lane.get('synergy',{}).get('red',{}).get('games'),
+        'Situação':{'available':'Disponível','missing':'Sem dados','insufficient_games':'Abaixo do mínimo'}[lane['status']]}
+        for lane in result['lanes']],width='stretch',hide_index=True)
 
 
 def signed(value):
@@ -87,6 +119,14 @@ def markdown_record(entry):
     lines += [f"- {pair_label(r)} ({SIDES[r['side']]}): {signed(r['indicator_gap_contribution'])} p.p.; {r['games']} Games." for r in explanation['opposing_relations']]
     lines += ['Alertas:']+[f'- {alert_text(a)}' for a in explanation['alerts']]
     lines += ['Anotações pessoais:',entry['notes'],explanation['method'],result['note']]
+    gold_result = entry.get('gold_result')
+    if gold_result:
+        lines += ['GD@15 — análise independente',f"Versão: {gold_result['model_version']}",
+                  f"Diferença azul − vermelho: {gold_result['total_gd15']} ouro",
+                  f"Cobertura: {gold_result['covered_positions']}/5",f"Pesos do bot: {gold_result['bot_weights']}"]
+        lines += [f"- {lane['position']}: {lane['blue']} × {lane['red']}: {lane['gd15']} ouro" for lane in gold_result['lanes']]
+    elif entry.get('gold_error'):
+        lines += ['GD@15 indisponível: '+entry['gold_error']]
     return '\n\n'.join(lines)
 
 
@@ -154,7 +194,7 @@ with st.sidebar:
         st.stop()
     st.caption(f"{len(options['champions'])} campeões · {len(options['patches'])} patches agregados")
     st.caption('Análises e anotações salvas automaticamente em um banco separado da coleta.')
-    with st.expander('Pesos e critérios'):
+    with st.expander('Winrate: pesos e critérios'):
         direct = st.number_input('Confronto direto (%)',0,100,40)
         indirect = st.number_input('Confronto indireto (%)',0,100,30)
         synergy = st.number_input('Sinergia (%)',0,100,30)
@@ -164,7 +204,7 @@ with st.sidebar:
     with st.expander('Origem dos dados'):
         st.write('Run ID:',options['run_id'])
         st.write('Patches:',', '.join(options['patches']))
-        st.caption('SQLite somente leitura. Gold/GD@15 e peso adicional por recência não são usados.')
+        st.caption('SQLite somente leitura. Winrate e GD@15 são calculados separadamente; sem peso adicional por recência.')
 weights = tuple(zip(WEIGHTS,(direct/100,indirect/100,synergy/100)))
 name = st.text_input('Nome da análise (opcional)',placeholder='Ex.: pré-jogo / composição de teste',key='draft_name')
 head_blue,head_swap,head_red = st.columns([5,2,5])
@@ -196,6 +236,12 @@ if duplicates:
 st.caption(f'{len(chosen)}/10 posições preenchidas · 5 confrontos diretos · 20 cruzamentos indiretos por lado · 10 pares de aliados')
 submitted = st.button('Analisar e registrar',type='primary',width='stretch',disabled=len(chosen)!=10 or bool(duplicates))
 if submitted:
+    gold_result, gold_error = None, None
+    try:
+        with st.spinner('Calculando ouro aos 15…'):
+            gold_result = calculate_gold(str(path),tuple(blue),tuple(red),options['run_id'],fingerprint,GOLD_MODEL_VERSION)
+    except (ValueError,OSError,sqlite3.Error) as exc:
+        gold_error = str(exc)
     try:
         if any(c is None for c in [*blue,*red]):
             raise ValueError('Preencha as cinco posições de cada time.')
@@ -203,6 +249,7 @@ if submitted:
             result = calculate(str(path),tuple(blue),tuple(red),options['run_id'],weights,int(minimum),fingerprint,MODEL_VERSION)
         entry = {'id':uuid.uuid4().hex,'name':name.strip() or f"Análise {len(st.session_state.analyses)+1}",
                  'created_at_utc':datetime.now(timezone.utc).isoformat(), 'result':result,
+                 'gold_result':gold_result,'gold_error':gold_error,
                  'explanation':explain_comparison(result,float(large_gap)), 'notes':'', 'tags':[],
                  'settings':{'database':str(path),'fingerprint':fingerprint,'minimum_games':int(minimum)}}
         history.save(entry)
@@ -212,6 +259,7 @@ if submitted:
         st.session_state['history_tag'] = 'Todas'
     except (ValueError,sqlite3.Error) as exc:
         st.error(str(exc))
+        render_gold(gold_result,gold_error)
 if not st.session_state.analyses:
     st.info('Selecione cinco campeões por lado e clique em Analisar e registrar. O banco original não será alterado.')
     st.stop()
@@ -282,6 +330,8 @@ for column,category in zip(st.columns(3),WEIGHTS):
           <div class="component-track"><div class="component-red" style="width:{red_value or 0}%"></div></div></div>""",unsafe_allow_html=True)
         st.caption(f"Pares com dados: azul {blue_component['found_pairs']}/{blue_component['queried_pairs']} · vermelho {red_component['found_pairs']}/{red_component['queried_pairs']}")
 st.caption('Indicadores comparativos, não probabilidades calibradas. As amostras de relações podem compartilhar partidas.')
+st.divider()
+render_gold(entry.get('gold_result'),entry.get('gold_error'))
 read_tab,evidence_tab,notes_tab,compare_tab = st.tabs(['Entender o resultado','Relações e cobertura','Anotações e exportação','Comparar análises'])
 with read_tab:
     st.caption('Decomposição matemática do indicador. Não demonstra causas reais de vitória.')
@@ -367,10 +417,13 @@ with compare_tab:
             relative = snapshot['result']['relative_indicator']
             comparison.append({'Análise':snapshot['name'],'Azul':relative['blue'] if relative else None,
                 'Vermelho':relative['red'] if relative else None,'Diferença azul − vermelho':snapshot['explanation']['indicator_gap'],
+                'GD@15 azul − vermelho':(snapshot.get('gold_result') or {}).get('total_gd15'),
                 'Patches':len(snapshot['result']['patches_used']),'Tags':', '.join(snapshot.get('tags',[]))})
         st.dataframe(comparison,width='stretch',hide_index=True)
         a,b = (snapshot['result'] for snapshot in selected_entries)
-        if any(a.get(k)!=b.get(k) for k in ('model_version','run_id','weights','patches_used')) or json.dumps(selected_entries[0]['settings'],sort_keys=True)!=json.dumps(selected_entries[1]['settings'],sort_keys=True):
+        gold_a,gold_b = (snapshot.get('gold_result') or {} for snapshot in selected_entries)
+        gold_changed = any(gold_a.get(k)!=gold_b.get(k) for k in ('model_version','bot_weights','minimum_games'))
+        if gold_changed or any(a.get(k)!=b.get(k) for k in ('model_version','run_id','weights','patches_used')) or json.dumps(selected_entries[0]['settings'],sort_keys=True)!=json.dumps(selected_entries[1]['settings'],sort_keys=True):
             st.warning('Esses registros usam configurações, versão ou base diferentes. A comparação não isola o efeito da troca de campeões.')
         st.caption('Comparação descritiva de análises salvas; não comprova qual modelo prevê melhor.')
 st.caption(result['note'])
