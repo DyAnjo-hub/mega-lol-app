@@ -13,6 +13,8 @@ import unicodedata
 
 WEIGHTS = {'Direct_Matchup': .40, 'Indirect_Matchup': .30, 'Ally_Synergy': .30}
 APPLICATION_ID = 0x4D4C4F4C
+POSITIONS = ('TOP', 'JUNGLE', 'MID', 'ADC', 'SUPPORT')
+MODEL_VERSION = 'ordered-direct-v1'
 
 
 def name_key(name):
@@ -182,7 +184,12 @@ def patch_sources(pair):
 
 
 def component(pairs, team, opponents, category, minimum_games):
-    candidates = list(itertools.combinations(sorted(team, key=name_key), 2)) if category == 'Ally_Synergy' else list(itertools.product(team, opponents))
+    if category == 'Ally_Synergy':
+        candidates = list(itertools.combinations(sorted(team, key=name_key), 2))
+    elif category == 'Direct_Matchup':
+        candidates = list(zip(team, opponents))
+    else:
+        candidates = [(first,second) for i,first in enumerate(team) for j,second in enumerate(opponents) if i != j]
     details = []
     for first, second in candidates:
         key = (category, name_key(first), name_key(second))
@@ -230,7 +237,8 @@ def compare_drafts(database, blue, red, *, patch=None, run_id=None, weights=None
     blue_score, red_score = teams['blue']['score'], teams['red']['score']
     denominator = blue_score + red_score if blue_score is not None and red_score is not None else None
     relative = {'blue':blue_score/denominator*100,'red':red_score/denominator*100} if denominator and denominator > 0 else None
-    return {'run_id':metadata['run_id'], 'patch':patch, 'patches_used':metadata['patches'] if patch is None else [patch],
+    return {'model_version':MODEL_VERSION, 'direct_alignment':[{'position':position,'blue':a,'red':b} for position,a,b in zip(POSITIONS,blue,red)],
+            'run_id':metadata['run_id'], 'patch':patch, 'patches_used':metadata['patches'] if patch is None else [patch],
             'drafts':{'blue':list(blue),'red':list(red)},
             'aggregation':'all_available_patches' if patch is None else 'single_patch_audit', 'weights':weights, 'teams':teams,
             'relative_indicator':relative,
@@ -298,7 +306,7 @@ def main():
     parser.add_argument('--database',required=True)
     parser.add_argument('--patch',help='Opcional: auditoria de um patch. Por padrão, agrega todos.')
     parser.add_argument('--run-id')
-    parser.add_argument('--blue',required=True,help='Cinco campeões separados por vírgulas, sem ordem de posição')
+    parser.add_argument('--blue',required=True,help='Cinco campeões separados por vírgulas na ordem TOP,JUNGLE,MID,ADC,SUPPORT')
     parser.add_argument('--red',required=True)
     args=parser.parse_args()
     try:

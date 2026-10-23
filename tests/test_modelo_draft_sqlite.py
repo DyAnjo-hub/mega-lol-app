@@ -62,7 +62,7 @@ class ModelTests(unittest.TestCase):
             self.assertAlmostEqual(result['relative_indicator']['blue'],60)
             self.assertEqual(result['weights'],model.WEIGHTS)
             for side in result['teams'].values():
-                self.assertEqual(side['components']['Direct_Matchup']['queried_pairs'],25)
+                self.assertEqual(side['components']['Direct_Matchup']['queried_pairs'],5)
                 self.assertEqual(side['components']['Ally_Synergy']['queried_pairs'],10)
             reordered=model.compare_drafts(db,BLUE[::-1],RED[::-1],patch='16.10')
             swapped=model.compare_drafts(db,RED,BLUE,patch='16.10')
@@ -156,6 +156,24 @@ class ModelTests(unittest.TestCase):
         pairs[('Ally_Synergy','b','a')].by_patch['16.10']=dict(pairs[('Ally_Synergy','b','a')].by_patch['16.11'],games=8,weighted_rate_sum=2)
         combined=model.component(pairs,['A','B'],[],'Ally_Synergy',1)
         self.assertEqual(combined['relation_games_sum'],30) # the reverse 8 is not added to 10
+
+    def test_direct_only_aligned_indirect_excludes_aligned_and_order_matters(self):
+        blue=['Ambessa','Skarner','Ryze','Lucian','Milio']
+        red=['Gnar','Wukong','Annie','Kalista','Renata Glasc']
+        direct=model.component({},blue,red,'Direct_Matchup',1)
+        indirect=model.component({},blue,red,'Indirect_Matchup',1)
+        self.assertEqual([(d['first'],d['second']) for d in direct['details']],list(zip(blue,red)))
+        self.assertEqual(direct['queried_pairs'],5)
+        self.assertEqual(indirect['queried_pairs'],20)
+        self.assertFalse(set(zip(blue,red)) & {(d['first'],d['second']) for d in indirect['details']})
+        with tempfile.TemporaryDirectory() as directory:
+            db=self.database(Path(directory));con=sqlite3.connect(db)
+            con.execute("UPDATE registros SET winrate=1 WHERE capture_id IN (SELECT capture_id FROM capturas WHERE selected_champion='A' AND category='Direct_Matchup') AND related_champion='F'")
+            con.commit();con.close()
+            original=model.compare_drafts(db,BLUE,RED)
+            changed=model.compare_drafts(db,BLUE,['G','F','H','I','J'])
+            self.assertNotEqual(original['teams']['blue']['components']['Direct_Matchup']['score'],changed['teams']['blue']['components']['Direct_Matchup']['score'])
+            self.assertEqual(original['teams']['blue']['components']['Ally_Synergy'],changed['teams']['blue']['components']['Ally_Synergy'])
 
     def test_mixed_context_refused_and_bad_inputs(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import uuid
 
 import streamlit as st
-from modelo_draft_sqlite import WEIGHTS, catalog, compare_drafts, explain_comparison
+from modelo_draft_sqlite import WEIGHTS, POSITIONS, MODEL_VERSION, catalog, compare_drafts, explain_comparison
 
 LABELS = {'Direct_Matchup':'Confronto direto','Indirect_Matchup':'Confronto indireto','Ally_Synergy':'Sinergia'}
 SIDES = {'blue':'Azul','red':'Vermelho','tie':'Equilíbrio'}
@@ -26,7 +26,7 @@ def available(database, run, fingerprint):
 
 
 @st.cache_data(show_spinner=False)
-def calculate(database, blue, red, run, weights, minimum, fingerprint):
+def calculate(database, blue, red, run, weights, minimum, fingerprint, model_version):
     return compare_drafts(database,list(blue),list(red),run_id=run,
                           weights=dict(weights),minimum_games=minimum)
 
@@ -60,6 +60,9 @@ def markdown_record(entry):
              f"Run ID: {result['run_id']}", 'Patches: '+', '.join(result['patches_used']),
              f"Indicador: {result['relative_indicator']}",
              'Contribuições à diferença do indicador (p.p.; positivo favorece azul):']
+    if result.get('direct_alignment'):
+        lines += ['Confrontos diretos alinhados:']
+        lines += [f"- {r['position']}: {r['blue']} × {r['red']}" for r in result['direct_alignment']]
     lines += [f"- {LABELS[c['category']]}: {signed(c['indicator_gap_contribution'])}" for c in explanation['components']]
     lines += ['Principais relações a favor do líder:']
     lines += [f"- {pair_label(r)} ({SIDES[r['side']]}): {signed(r['indicator_gap_contribution'])} p.p.; {r['games']} Games." for r in explanation['supporting_relations']]
@@ -104,18 +107,18 @@ with st.form('draft_form'):
     left,right = st.columns(2)
     with left:
         st.subheader('🔵 Time azul')
-        blue = st.multiselect('Campeões azuis',options['champions'],max_selections=5)
-        st.caption('Selecione cinco campeões.')
+        blue = [st.selectbox('Azul — '+position,options['champions'],index=None,placeholder='Escolha o campeão',key='blue_'+position) for position in POSITIONS]
     with right:
         st.subheader('🔴 Time vermelho')
-        red = st.multiselect('Campeões vermelhos',options['champions'],max_selections=5)
-        st.caption('Selecione cinco campeões.')
-    st.caption('Sem ordem de função. O cálculo une roles e patches pelos Games, mantendo a origem no detalhamento.')
+        red = [st.selectbox('Vermelho — '+position,options['champions'],index=None,placeholder='Escolha o campeão',key='red_'+position) for position in POSITIONS]
+    st.caption('Direta: TOP × TOP, JUNGLE × JUNGLE, MID × MID, ADC × ADC e SUPPORT × SUPPORT. Indireta: os outros 20 cruzamentos. Sinergia: os dez pares de aliados.')
     submitted = st.form_submit_button('Analisar e registrar',type='primary',width='stretch')
 if submitted:
     try:
+        if any(c is None for c in [*blue,*red]):
+            raise ValueError('Preencha as cinco posições de cada time.')
         with st.spinner('Consultando as relações do draft…'):
-            result = calculate(str(path),tuple(blue),tuple(red),options['run_id'],weights,int(minimum),fingerprint)
+            result = calculate(str(path),tuple(blue),tuple(red),options['run_id'],weights,int(minimum),fingerprint,MODEL_VERSION)
         entry = {'id':uuid.uuid4().hex,'name':name.strip() or f"Análise {len(st.session_state.analyses)+1}",
                  'created_at_utc':datetime.now(timezone.utc).isoformat(), 'result':result,
                  'explanation':explain_comparison(result,float(large_gap)), 'notes':'',
@@ -132,7 +135,7 @@ entries = {e['id']:e for e in st.session_state.analyses}
 selected = st.selectbox('Registro desta sessão',list(entries),format_func=lambda key:entries[key]['name'],key='selected_analysis')
 entry = entries[selected]
 result, explanation = entry['result'],entry['explanation']
-if (list(blue) != result['drafts']['blue'] or list(red) != result['drafts']['red'] or
+if (result.get('model_version') != MODEL_VERSION or list(blue) != result['drafts']['blue'] or list(red) != result['drafts']['red'] or
         weights != tuple(result['weights'].items()) or str(path) != entry['settings']['database'] or
         options['run_id'] != result['run_id'] or int(minimum) != entry['settings']['minimum_games'] or
         float(large_gap) != explanation['large_gap_threshold'] or
@@ -142,6 +145,9 @@ st.subheader(entry['name'])
 st.caption(f"Registrado em {entry['created_at_utc']} · {len(result['patches_used'])} patches de origem")
 st.write('**Azul:** '+', '.join(result['drafts']['blue']))
 st.write('**Vermelho:** '+', '.join(result['drafts']['red']))
+if result.get('direct_alignment'):
+    with st.expander('Conferir os cinco confrontos diretos',expanded=True):
+        st.dataframe([{'Posição':row['position'],'Azul':row['blue'],'Vermelho':row['red']} for row in result['direct_alignment']],width='stretch',hide_index=True)
 if result['relative_indicator'] is None:
     st.warning('Indicador final indisponível. Há componentes sem dados utilizáveis ou scores incompatíveis com a normalização.')
 else:

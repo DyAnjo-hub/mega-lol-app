@@ -16,7 +16,7 @@ cd D:\Importacao_s16
 ```
 
 Escolha `mega_lol_s16.sqlite`, cinco campeões distintos por lado. Todos os patches disponíveis são agregados automaticamente.
-Não há ordem de posições. Run ID fica vazio se o banco contém apenas uma execução;
+A ordem é TOP, JUNGLE, MID, ADC e SUPPORT nos dois times. Run ID fica vazio se o banco contém apenas uma execução;
 caso contrário, informe-o explicitamente. O browser é local, sem gol.gg ou login.
 
 Também é possível executar o modelo sem interface e sem pacotes externos:
@@ -41,9 +41,12 @@ filtros que eram desconhecidos na coleta. Não há fusão com a planilha antiga.
 
 ## Cálculo
 
-Para cada lado, são consultados os 25 cruzamentos contra os cinco adversários em
-Direct_Matchup e, separadamente, os 25 em Indirect_Matchup. Isso não exige função
-nem pressupõe que todos os cruzamentos terão dados nessas duas categorias.
+Para cada lado, Direct_Matchup consulta apenas os cinco pares alinhados pela
+ordem informada (TOP×TOP, JUNGLE×JUNGLE, MID×MID, ADC×ADC e SUPPORT×SUPPORT).
+Indirect_Matchup consulta os outros 20 cruzamentos, excluindo os rivais alinhados.
+As posições vêm da entrada do usuário; a role de origem das linhas não é
+reinterpretada nem filtrada. A agregação de roles por par/patch permanece.
+A interface oferece cinco seletores por lado e mostra os confrontos antes dos resultados.
 Cada componente usa a média ponderada por Games das relações encontradas.
 
 Na sinergia, consultam-se os 10 pares não ordenados de aliados. Se há A→B e B→A,
@@ -66,7 +69,7 @@ Sem componente utilizável com peso positivo, o score final fica indisponível:
 não se inventa 50% nem se redistribuem pesos automaticamente. A interface ainda
 mostra os componentes disponíveis. Pares ausentes são excluídos da média daquele
 componente e exibidos explicitamente. O resultado pode existir com cobertura parcial;
-confira a cobertura antes de interpretar o indicador. Os denominadores 25/25/10
+confira a cobertura antes de interpretar o indicador. Os denominadores 5/20/10
 são pares consultados, não uma prova de que todos deveriam existir no site.
 
 A normalização de nomes resolve espaços, apóstrofos e pontuação comuns, preservando
@@ -140,3 +143,11 @@ python -m unittest discover -s tests -p test_explicacoes_draft.py -v
 Incluem reconstrução exata da diferença por componentes e relações, normalização
 com denominador diferente de 100, sinais/líder, empates, limiar visual e falta de
 componentes. A interface também foi exercitada com a base real e anotações em sessão.
+
+
+A versão ordered-direct-v1 torna a ordem do draft significativa para direta e
+indireta. Reordenar somente um time muda seus rivais alinhados; reordenar os dois
+com a mesma permutação preserva os confrontos. Sinergia continua independente da
+ordem. Análises de versões anteriores podem mudar numericamente e devem ser
+refeitas com as posições preenchidas corretamente. Nenhuma mudança no SQLite,
+pesos 40/30/30 ou agregação do histórico é necessária.
